@@ -1,0 +1,2 @@
+-keep class org.mozilla.javascript.** { *; }
+-keep class com.sengine.engine.script.api.** { *; }

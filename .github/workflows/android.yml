@@ -1,0 +1,62 @@
+name: Build S Engine APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Unit tests (headless engine simulation)
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest 2>&1 | tee test.log; code=${PIPESTATUS[0]}
+          msg=$(grep -E "SIM |FAILED|Exception|expected|AssertionError|at com.sengine" test.log | head -80 | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::notice title=Engine tests::${msg}"
+          exit $code
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew --no-daemon assembleDebug 2>&1 | tee build.log || {
+            # surface compiler errors as annotations
+            msg=$(grep -E "^e: |error:|What went wrong|Could not|FAILURE" build.log | head -60 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Build errors::${msg}"
+            exit 1
+          }
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SEngine-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Publish rolling "latest build" pre-release
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk SEngine.apk
+          gh release delete sengine-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create sengine-latest SEngine.apk \
+            --target "${GITHUB_SHA}" --prerelease \
+            --title "S Engine – latest build" \
+            --notes "Automatic debug build of ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}. Install SEngine.apk on Android 8.0+."
+        env:
+          GH_TOKEN: ${{ github.token }}
