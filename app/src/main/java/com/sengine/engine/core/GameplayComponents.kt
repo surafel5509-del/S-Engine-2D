@@ -300,6 +300,129 @@ class TileMap2D : Component() {
         return changed
     }
 
+    // ---------------------------------------------------------------- brush operations
+
+    /** Square brush: paints [size]² cells centred on the cursor. Used by the tile editor. */
+    fun paintBrush(layerIndex: Int, cellX: Int, cellY: Int, tileId: Int, size: Int = 1, randomize: Boolean = false): Int {
+        val set = runtimeTileSet
+        val half = (size.coerceIn(1, 32) - 1) / 2
+        var changed = 0
+        for (dy in 0 until size) {
+            for (dx in 0 until size) {
+                val x = cellX + dx - half
+                val y = cellY + dy - half
+                val id = if (randomize && set != null) com.sengine.engine.tilemap.TileBrush.randomTile(set, x, y) else tileId
+                if (setTile(layerIndex, x, y, id)) changed++
+            }
+        }
+        return changed
+    }
+
+    /** Straight line of cells (Bresenham), with the brush size applied on top. */
+    fun drawLine(layerIndex: Int, x0: Int, y0: Int, x1: Int, y1: Int, tileId: Int, size: Int = 1, randomize: Boolean = false): Int {
+        val layer = data.layers.getOrNull(layerIndex) ?: return 0
+        val before = layer.cells.copyOf()
+        val scratch = com.sengine.engine.tilemap.TileLayer("scratch", layer.width, layer.height)
+        com.sengine.engine.tilemap.TileBrush.line(scratch, x0, y0, x1, y1, tileId)
+        val set = runtimeTileSet
+        var changed = 0
+        for (y in 0 until layer.height) {
+            for (x in 0 until layer.width) {
+                if (scratch[x, y] != tileId) continue
+                val id = if (randomize && set != null) com.sengine.engine.tilemap.TileBrush.randomTile(set, x, y) else tileId
+                if (before[y * layer.width + x] != id) {
+                    layer[x, y] = id
+                    changed++
+                }
+            }
+        }
+        return changed
+    }
+
+    /** Rectangle outline or filled rectangle of cells. */
+    fun drawRect(layerIndex: Int, x0: Int, y0: Int, x1: Int, y1: Int, tileId: Int, filled: Boolean = true): Int {
+        val layer = data.layers.getOrNull(layerIndex) ?: return 0
+        val scratch = com.sengine.engine.tilemap.TileLayer("scratch", layer.width, layer.height)
+        com.sengine.engine.tilemap.TileBrush.rect(scratch, x0, y0, x1, y1, tileId, filled)
+        var changed = 0
+        for (y in 0 until layer.height) {
+            for (x in 0 until layer.width) {
+                if (scratch[x, y] != tileId) continue
+                if (setTile(layerIndex, x, y, tileId)) changed++
+            }
+        }
+        return changed
+    }
+
+    /** Flood fill (bounded scanline algorithm in [com.sengine.engine.tilemap.TileBrush.fill]). */
+    fun floodFill(layerIndex: Int, cellX: Int, cellY: Int, tileId: Int, randomize: Boolean = false): Int {
+        val layer = data.layers.getOrNull(layerIndex) ?: return 0
+        val target = layer[cellX, cellY]
+        if (target == tileId && !randomize) return 0
+        val before = layer.cells.copyOf()
+        if (randomize) {
+            val set = runtimeTileSet
+            // identical neighbours get randomized variants: a quick way to break up flat terrain
+            val stack = ArrayDeque<IntArray>()
+            stack.add(intArrayOf(cellX, cellY))
+            while (stack.isNotEmpty()) {
+                val p = stack.removeLast()
+                val x = p[0]; val y = p[1]
+                if (!layer.inBounds(x, y) || layer[x, y] != target) continue
+                layer[x, y] = if (set != null) com.sengine.engine.tilemap.TileBrush.randomTile(set, x, y) else tileId
+                stack.add(intArrayOf(x + 1, y)); stack.add(intArrayOf(x - 1, y))
+                stack.add(intArrayOf(x, y + 1)); stack.add(intArrayOf(x, y - 1))
+            }
+        } else {
+            com.sengine.engine.tilemap.TileBrush.fill(layer, cellX, cellY, tileId)
+        }
+        var changed = 0
+        for (i in before.indices) if (before[i] != layer.cells[i]) changed++
+        return changed
+    }
+
+    /** Applies terrain/autotile resolution around a cell (uses tile `tags` like `mask:5`). */
+    fun applyAutotile(layerIndex: Int, cellX: Int, cellY: Int, radius: Int = 1): Int {
+        val layer = data.layers.getOrNull(layerIndex) ?: return 0
+        val set = runtimeTileSet ?: return 0
+        var changed = 0
+        for (y in cellY - radius..cellY + radius) {
+            for (x in cellX - radius..cellX + radius) {
+                if (!layer.inBounds(x, y)) continue
+                val id = layer[x, y]
+                if (id == 0) continue
+                val def = set.tile(id) ?: continue
+                if (def.terrainGroup.isEmpty()) continue
+                val mask = com.sengine.engine.tilemap.Terrain.maskOf(layer, set, x, y, def.terrainGroup)
+                val resolved = com.sengine.engine.tilemap.Terrain.resolve(set, def.terrainGroup, mask) ?: continue
+                if (resolved != id && setTile(layerIndex, x, y, resolved)) changed++
+            }
+        }
+        return changed
+    }
+
+    /** Adds a layer sized like the map and returns its index. */
+    fun addLayer(name: String, width: Int, height: Int): Int {
+        data.addLayer(name, width, height)
+        return data.layers.size - 1
+    }
+
+    /** Removes a layer by index, keeping at least one layer alive. */
+    fun removeLayer(index: Int): Boolean {
+        if (data.layers.size <= 1) return false
+        if (index !in data.layers.indices) return false
+        data.layers.removeAt(index)
+        return true
+    }
+
+    fun moveLayer(index: Int, delta: Int): Boolean {
+        val target = index + delta
+        if (index !in data.layers.indices || target !in data.layers.indices) return false
+        val layer = data.layers.removeAt(index)
+        data.layers.add(target, layer)
+        return true
+    }
+
     /** World position of a cell's top-left corner. */
     fun cellToWorld(cellX: Int, cellY: Int): Pair<Float, Float> {
         val go = if (attached) gameObject else return 0f to 0f

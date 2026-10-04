@@ -71,6 +71,19 @@ class EditorState {
     @Volatile var resolutionPreview = 0     // index into PREVIEW_SIZES, 0 = fit viewport
     @Volatile var frameSelectedPending = false
 
+    /** Marquee rectangle in world space while a rectangular selection is in progress. */
+    @Volatile var selectionRect: FloatArray? = null
+
+    /** Node under the mouse pointer (hover highlight drawn by the overlay). */
+    @Volatile var hoveredNodeId = -1L
+
+    /** True while a multi-select modifier (Shift/Ctrl) is held — touch users use long press instead. */
+    @Volatile var multiSelect = false
+
+    /** Guides are grabbable in the viewport; the brush marks the tool that owns the paint cursor. */
+    @Volatile var hoveredTileX = 0
+    @Volatile var hoveredTileY = 0
+
     /** Free-floating guides drawn in the viewport (world space segments). */
     val guides = ArrayList<FloatArray>()
 
@@ -99,6 +112,11 @@ class EditorState {
         overlay.gizmoScale = (view.size / 6f).coerceIn(0.4f, 4f)
         overlay.pixelGridStep = 1f / pixelsPerUnit.coerceAtLeast(1f)
         overlay.guides = if (showGuides) guides else emptyList()
+        overlay.selectionRect = selectionRect
+        overlay.hoveredId = hoveredNodeId
+        overlay.showCanvasFrame = true
+        overlay.canvasWidth = view.widthPx.toFloat() / view.pixelsPerUnit.coerceAtLeast(0.0001f)
+        overlay.canvasHeight = view.heightPx.toFloat() / view.pixelsPerUnit.coerceAtLeast(0.0001f)
     }
 
     companion object {

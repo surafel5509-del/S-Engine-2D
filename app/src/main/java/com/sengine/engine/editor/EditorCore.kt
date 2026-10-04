@@ -5,6 +5,7 @@ import com.sengine.engine.core.GameObject
 import com.sengine.engine.core.NodeType
 import com.sengine.engine.core.Prop
 import com.sengine.engine.core.Scene
+import com.sengine.engine.core.TileMap2D
 import com.sengine.engine.core.SignalConnection
 import com.sengine.engine.json.JVal
 import com.sengine.engine.json.Json
@@ -829,6 +830,38 @@ class TileBrushState {
     var autotile = false
     var terrainGroup = ""
     var filledRect = true
+}
+
+/**
+ * Records the cells a brush stroke touches so the whole stroke becomes one undo step.
+ * Cells are stored as `(x, y, before, after)` quadruples — the same shape [TilePaintCommand] uses.
+ */
+class TileStroke(private val nodeId: Long, private val layerName: String, private val layerWidth: Int) {
+    private val changes = LinkedHashMap<Int, IntArray>()
+
+    fun record(index: Int, before: Int, after: Int) {
+        if (before == after) return
+        val existing = changes[index]
+        if (existing == null) changes[index] = intArrayOf(before, after) else existing[1] = after
+    }
+
+    val size get() = changes.size
+
+    fun toCommand(label: String): TilePaintCommand? {
+        if (changes.isEmpty()) return null
+        val cells = IntArray(changes.size * 4)
+        var i = 0
+        for ((index, values) in changes) {
+            if (values[0] == values[1]) continue
+            cells[i] = index % layerWidth
+            cells[i + 1] = index / layerWidth
+            cells[i + 2] = values[0]
+            cells[i + 3] = values[1]
+            i += 4
+        }
+        if (i == 0) return null
+        return TilePaintCommand(label, nodeId, layerName, cells.copyOf(i))
+    }
 }
 
 /** Snapshot helper used before a stroke starts (undo of a whole gesture). */

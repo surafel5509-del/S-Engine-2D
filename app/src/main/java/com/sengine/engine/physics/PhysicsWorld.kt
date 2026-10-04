@@ -160,19 +160,19 @@ class PhysicsWorld {
                     rb.grounded = false
                     rb.onWall = 0
                     rb.onCeiling = false
-                    integrate(b, rb.vx * dt, rb.vy * dt, dt)
+                    integrateBody(b, rb.vx * dt, rb.vy * dt, dt)
                     moving.add(b)
                 }
                 BodyType.KINEMATIC -> {
                     rb.grounded = false
-                    integrate(b, rb.vx * dt, rb.vy * dt, dt)
+                    integrateBody(b, rb.vx * dt, rb.vy * dt, dt)
                     moving.add(b)
                 }
                 BodyType.CHARACTER -> {
                     rb.grounded = false
                     rb.onWall = 0
                     rb.onCeiling = false
-                    integrate(b, rb.vx * dt, rb.vy * dt, dt)
+                    integrateBody(b, rb.vx * dt, rb.vy * dt, dt)
                     moving.add(b)
                 }
                 else -> {}
@@ -661,6 +661,51 @@ class PhysicsWorld {
         rb.vy += iy * b.invMass
     }
 
+    /**
+     * Moves a body by (dx,dy) for this step.
+     *
+     * Bodies flagged [Rigidbody2D.continuous] are swept in sub-steps bounded by their own size
+     * instead of teleporting by `velocity * dt`: a fast bullet, dash or falling platform can then
+     * never pass through a thin wall. Sub-steps are capped so the cost stays bounded.
+     */
+    private fun integrateBody(b: Body, dx: Float, dy: Float, dt: Float) {
+        val rb = b.rb
+        if (rb == null || !rb.continuous || (dx == 0f && dy == 0f)) {
+            integrate(b, dx, dy, dt)
+            return
+        }
+        val extent = if (b.shape == ColliderShape.CIRCLE) b.radius * 2f else minOf(b.hw, b.hh) * 2f
+        val bound = (extent * 0.75f).coerceAtLeast(0.02f)
+        val steps = ((sqrt(dx * dx + dy * dy) / bound).toInt() + 1).coerceIn(1, MAX_CCD_STEPS)
+        val sx = dx / steps
+        val sy = dy / steps
+        for (i in 0 until steps) {
+            integrate(b, sx, sy, dt / steps)
+            if (sweptIntoGeometry(b)) {
+                // step back to the last free position and stop: the contact solver separates the rest
+                moveWorld(b.go, -sx, -sy)
+                refresh(b)
+                rb.vx = 0f
+                rb.vy = 0f
+                return
+            }
+        }
+    }
+
+    /** True when the body overlaps solid geometry (used by the continuous sweep). */
+    private fun sweptIntoGeometry(b: Body): Boolean {
+        for (o in bodies) {
+            if (o === b || o.isArea || o.isTrigger) continue
+            if (!canCollide(b, o)) continue
+            if (overlapsAabb(b, o)) return true
+        }
+        for (t in tileBodies) if (overlapsAabb(b, t)) return true
+        return false
+    }
+
+    private fun overlapsAabb(a: Body, b: Body): Boolean =
+        a.minX < b.maxX && a.maxX > b.minX && a.minY < b.maxY && a.maxY > b.minY
+
     private fun integrate(b: Body, dx: Float, dy: Float, dt: Float) {
         val rb = b.rb ?: return
         if (b.go.parent == null) {
@@ -961,5 +1006,8 @@ class PhysicsWorld {
     companion object {
         private const val SLEEP_SPEED = 0.05f
         private const val SLEEP_TIME = 0.6f
+
+        /** Upper bound for continuous-collision sub-steps per body per tick. */
+        private const val MAX_CCD_STEPS = 16
     }
 }

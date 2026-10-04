@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Typeface
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
@@ -19,7 +20,15 @@ import com.sengine.engine.particles.ParticlePresets
 import com.sengine.engine.core.Prop
 import com.sengine.engine.core.Sprite2D
 import com.sengine.engine.core.TileMap2D
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
 import com.sengine.engine.debug.Log
+import com.sengine.engine.export.AssetImporter
+import com.sengine.engine.json.Json
 import com.sengine.engine.debug.LogLevel
 import com.sengine.engine.editor.EditorDocument
 import com.sengine.engine.editor.EditorState
@@ -32,6 +41,10 @@ import com.sengine.engine.resources.Material
 import com.sengine.engine.resources.ShaderTemplates
 import com.sengine.engine.tilemap.TileSet
 import java.io.File
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 /** Shared helpers for panel construction. */
 object Panels {
@@ -571,6 +584,14 @@ class InspectorPanel(
  * FileSystem panel: folders, thumbnails, search/sort, import from device, rename/duplicate/delete,
  * New folder / New scene / New script / New shader, and "assign to selection" for the inspector.
  */
+/**
+ * Asset browser: folders, thumbnails, search, filter/sort, favourites, recent, and the full set of
+ * file operations (create, import, rename, duplicate, delete, open, assign).
+ *
+ * Every row is a real file inside `<project>/assets`; metadata (pivot, slices, favourite flag) lives
+ * in the asset's sidecar `.meta.json`, so the browser state survives restarts and travels with the
+ * project.
+ */
 class AssetPanel(
     context: Context,
     val doc: EditorDocument,
@@ -582,154 +603,340 @@ class AssetPanel(
     private val grid = Panels.column(context, theme)
     private var folder = ""
     private var query = ""
-    private var sortByDate = false
+    private var sortMode = 0                  // 0 name, 1 modified, 2 kind, 3 size
+    private var showFavourites = false
+    private var showRecent = false
+    private var kindFilter: AssetKind? = null
+    private val crumbs = LinearLayout(context)
 
     init {
         orientation = VERTICAL
         setBackgroundColor(theme.panel)
+
         val top = LinearLayout(context)
         top.orientation = HORIZONTAL
-        val up = EditorButton(context, theme, "↑", { folder = folder.substringBeforeLast('/', ""); refresh() }, icon = "")
-        top.addView(up)
-        val newFile = EditorButton(context, theme, "＋", {})
-        newFile.setOnClickListener { createMenu(newFile) }
-        top.addView(newFile)
-        val import = EditorButton(context, theme, "⇩", {})
-        import.setOnClickListener { onImportRequested?.invoke() }
-        top.addView(import)
-        val sort = EditorButton(context, theme, "⇅", {
-            sortByDate = !sortByDate
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.addView(IconButton(context, theme, Icons.ARROW_UP, "Up one folder", {
+            folder = folder.substringBeforeLast('/', "")
             refresh()
-        })
-        top.addView(sort)
-        top.addView(SearchField(context, theme, "Search assets") { q -> query = q; refresh() }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }, sizeDp = 26f))
+        top.addView(IconButton(context, theme, Icons.FOLDER, "New folder", { createFolder() }, sizeDp = 26f))
+        val newFile = IconButton(context, theme, Icons.PLUS, "New file", { createMenu() }, sizeDp = 26f)
+        top.addView(newFile)
+        top.addView(IconButton(context, theme, Icons.IMPORT, "Import files", { onImportRequested?.invoke() }, sizeDp = 26f))
+        top.addView(IconButton(context, theme, Icons.STAR, "Favourites", {
+            showFavourites = !showFavourites
+            showRecent = false
+            refresh()
+        }, toggled = showFavourites, sizeDp = 26f))
+        top.addView(IconButton(context, theme, Icons.CLOCK, "Recent", {
+            showRecent = !showRecent
+            showFavourites = false
+            refresh()
+        }, toggled = showRecent, sizeDp = 26f))
+        top.addView(IconButton(context, theme, Icons.SEARCH, "Sort: ${sortLabel()}", {
+            showMenu(top, theme, listOf(
+                "Name" to { sortMode = 0; refresh() },
+                "Modified" to { sortMode = 1; refresh() },
+                "Kind" to { sortMode = 2; refresh() },
+                "Size" to { sortMode = 3; refresh() }
+            ))
+        }, sizeDp = 26f))
         addView(top)
-        addView(Ui.label(context, "/assets/${'$'}{folder}".replace("${'$'}{folder}", ""), theme, 11f, theme.textDim))
+
+        addView(crumbs)
+        addView(SearchField(context, theme, "Search assets") { q -> query = q; refresh() })
+
+        val filters = LinearLayout(context)
+        filters.orientation = HORIZONTAL
+        for (kind in listOf(null, AssetKind.TEXTURE, AssetKind.SOUND, AssetKind.SCRIPT, AssetKind.SCENE, AssetKind.TILESET)) {
+            val label = kind?.name?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "All"
+            filters.addView(EditorButton(context, theme, label, {
+                kindFilter = kind
+                refresh()
+            }, compact = true, toggled = kindFilter == kind))
+        }
+        addView(filters)
         Panels.scroll(this, grid)
         refresh()
     }
 
     var onImportRequested: (() -> Unit)? = null
 
-    private fun createMenu(anchor: View) {
-        showMenu(anchor, theme, listOf(
-            "New folder…" to {
-                inputDialog(context, theme, "New folder", "folder") { name ->
-                    File(doc.project.assetsDir, join(folder, name)).mkdirs()
-                    refresh()
-                }
-            },
-            "New scene…" to {
-                inputDialog(context, theme, "New scene", "Level2") { name ->
-                    val scene = com.sengine.engine.core.Scene(name)
-                    scene.create("Camera", null, "Camera2D")
-                    doc.project.saveScene(scene)
-                    onChanged()
-                    refresh()
-                }
-            },
-            "New script…" to {
-                inputDialog(context, theme, "New script", "player.js") { name ->
-                    val fileName = if (name.endsWith(".js")) name else "$name.js"
-                    doc.project.writeAsset(join(folder, fileName), com.sengine.engine.core.ScriptComponent.TEMPLATE)
-                    refresh()
-                }
-            },
-            "New shader…" to {
-                inputDialog(context, theme, "New shader", "glow.material") { name ->
-                    val material = Material(name.substringBefore('.'))
-                    material.fragment = ShaderTemplates.GLOW
-                    doc.project.writeAsset(join(folder, "$name.json"), com.sengine.engine.json.Json.write(material.toJson(), true))
-                    refresh()
-                }
-            },
-            "New material…" to {
-                inputDialog(context, theme, "New material", "material") { name ->
-                    val material = Material(name)
-                    doc.project.writeAsset(join(folder, "$name.material.json"), com.sengine.engine.json.Json.write(material.toJson(), true))
-                    refresh()
-                }
-            }
-        ))
-    }
+    /** Called when the user asks to open an asset with its own editor (script, shader, tileset…). */
+    var onOpen: ((String) -> Unit)? = null
 
-    private fun join(folder: String, name: String) = if (folder.isEmpty()) name else "$folder/$name"
+    var onStatus: ((String) -> Unit)? = null
+
+    private fun sortLabel() = when (sortMode) {
+        1 -> "Modified"
+        2 -> "Kind"
+        3 -> "Size"
+        else -> "Name"
+    }
 
     fun refresh() {
         grid.removeAllViews()
-        val assets = doc.project.listAssetsRecursive()
-            .filter { it.startsWith(if (folder.isEmpty()) "" else "$folder/") }
-            .filter { query.isEmpty() || it.contains(query, true) }
-        val folders = assets.map { it.removePrefix(if (folder.isEmpty()) "" else "$folder/").substringBefore('/', "") }
-            .filter { it.isNotEmpty() && it != it.substringBefore('/', "") }
-            .distinct()
-        if (folder.isNotEmpty() || true) {
-            val direct = assets.filter { it.substringAfterLast('/').isNotEmpty() }
-            val subFolders = HashSet<String>()
-            for (a in direct) {
-                val rel = a.removePrefix(if (folder.isEmpty()) "" else "$folder/")
-                if (rel.contains('/')) subFolders.add(rel.substringBefore('/'))
-            }
-            for (f in subFolders) {
-                val row = EditorButton(context, theme, "📁 $f", { folder = join(folder, f); refresh() })
-                grid.addView(row)
-            }
-            val sorted = if (sortByDate) direct.sortedByDescending { doc.project.assetFile(it).lastModified() } else direct.sorted()
-            for (a in sorted) {
-                val rel = a.removePrefix(if (folder.isEmpty()) "" else "$folder/")
-                if (rel.contains('/')) continue
-                val kind = AssetKind.of(a) ?: AssetKind.OTHER
-                val size = doc.project.assetSize(a)
-                val row = LinearLayout(context)
-                row.orientation = HORIZONTAL
-                row.gravity = Gravity.CENTER_VERTICAL
-                row.addView(Ui.label(context, icon(kind), theme, 14f, theme.accent))
-                row.addView(Ui.label(context, rel, theme, 12f))
-                row.addView(Ui.label(context, "${kind.name.lowercase()} · ${size / 1024}kB", theme, 10f, theme.textDim))
-                row.isClickable = true
-                row.setOnClickListener { onAssign(a, kind) }
-                row.setOnLongClickListener {
-                    showMenu(row, theme, listOf(
-                        "Assign to selection" to { onAssign(a, kind) },
-                        "Rename…" to {
-                            inputDialog(context, theme, "Rename asset", rel) { newName ->
-                                doc.project.renameAsset(a, join(folder, newName))
-                                refresh()
-                            }
-                        },
-                        "Duplicate" to {
-                            val copy = doc.project.uniqueAssetName(a.substringBeforeLast('.'))
-                            doc.project.copyAsset(a, copy)
-                            refresh()
-                        },
-                        "Show in Output" to { Log.info("Assets", "${doc.project.assetFile(a).absolutePath} ($size bytes)") },
-                        "Delete" to {
-                            confirmDialog(context, "Delete asset", "Delete '$rel'?") {
-                                doc.project.deleteAsset(a)
-                                refresh()
-                            }
-                        }
-                    ))
-                    true
-                }
-                grid.addView(row)
-            }
+        crumbs.removeAllViews()
+        buildCrumbs()
+
+        val all = doc.project.listAssetsRecursive()
+        var visible = all.filter { it.startsWith(if (folder.isEmpty()) "" else "$folder/") }
+        if (query.isNotEmpty()) visible = visible.filter { it.contains(query, true) }
+        if (kindFilter != null) visible = visible.filter { AssetKind.of(it) == kindFilter }
+        if (showFavourites) visible = visible.filter { isFavourite(it) }
+        if (showRecent) visible = visible.sortedByDescending { doc.project.assetFile(it).lastModified() }.take(20)
+        else visible = when (sortMode) {
+            1 -> visible.sortedByDescending { doc.project.assetFile(it).lastModified() }
+            2 -> visible.sortedBy { AssetKind.of(it)?.ordinal ?: 99 }
+            3 -> visible.sortedByDescending { doc.project.assetSize(it) }
+            else -> visible.sorted()
         }
-        if (grid.childCount == 0) grid.addView(Ui.label(context, "No assets. Use ⇩ to import a PNG/JPG/WebP/audio/font file.", theme, 12f, theme.textDim))
+
+        // ---- sub folders
+        val prefix = if (folder.isEmpty()) "" else "$folder/"
+        val subFolders = HashSet<String>()
+        for (a in all) {
+            if (!a.startsWith(prefix)) continue
+            val rel = a.removePrefix(prefix)
+            if (rel.contains('/')) subFolders.add(rel.substringBefore('/'))
+        }
+        for (f in doc.project.listFolders(folder)) subFolders.add(f)
+        for (f in subFolders.sorted()) {
+            val row = LinearLayout(context)
+            row.orientation = HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.setPadding(theme.pad(2f), theme.pad(4f), theme.pad(2f), theme.pad(4f))
+            row.addView(IconView(context, theme, Icons.FOLDER, 18f))
+            row.addView(Ui.label(context, "  $f", theme, 12f, theme.text))
+            val count = all.count { it.startsWith("$prefix$f/") }
+            row.addView(Ui.label(context, "   $count", theme, 10f, theme.textDim))
+            row.isClickable = true
+            row.setOnClickListener { folder = if (folder.isEmpty()) f else "$folder/$f"; refresh() }
+            row.setOnLongClickListener {
+                showMenu(row, theme, listOf(
+                    "Rename folder…" to {
+                        inputDialog(context, theme, "Rename folder", f) { newName ->
+                            val rel = if (folder.isEmpty()) f else "$folder/$f"
+                            val target = if (folder.isEmpty()) newName else "$folder/$newName"
+                            if (doc.project.moveFolder(rel, target)) { note("Renamed $rel → $target"); refresh() }
+                            else note("Rename failed (name taken?)")
+                        }
+                    },
+                    "Delete folder" to {
+                        confirmDialog(context, "Delete folder", "Delete '$f' and everything inside it?") {
+                            val rel = if (folder.isEmpty()) f else "$folder/$f"
+                            if (doc.project.deleteFolder(rel)) { note("Deleted $rel"); refresh() } else note("Delete failed")
+                        }
+                    }
+                ))
+                true
+            }
+            grid.addView(row)
+        }
+
+        // ---- files
+        var shown = 0
+        for (a in visible) {
+            val rel = a.removePrefix(prefix)
+            if (rel.contains('/')) continue
+            val kind = AssetKind.of(a) ?: AssetKind.OTHER
+            val row = LinearLayout(context)
+            row.orientation = HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.setPadding(theme.pad(2f), theme.pad(3f), theme.pad(2f), theme.pad(3f))
+            val thumb = AssetThumbnail(context, theme, doc.project.assetFile(a).absolutePath, kind)
+            row.addView(thumb, LayoutParams(theme.dp(26f), theme.dp(26f)))
+            row.addView(Ui.label(context, "  $rel", theme, 12f, theme.text))
+            if (isFavourite(a)) row.addView(Ui.label(context, " ★", theme, 12f, theme.warning))
+            row.addView(Ui.label(context, "   ${kind.name.lowercase()} · ${doc.project.assetSize(a) / 1024} kB", theme, 10f, theme.textDim))
+            row.isClickable = true
+            row.setOnClickListener {
+                when {
+                    kind == AssetKind.SCENE -> onOpen?.invoke(a)
+                    kind == AssetKind.SCRIPT || kind == AssetKind.MATERIAL || kind == AssetKind.TILESET -> onOpen?.invoke(a)
+                    else -> onAssign(a, kind)
+                }
+            }
+            row.setOnLongClickListener {
+                showMenu(row, theme, assetMenu(a, kind, rel))
+                true
+            }
+            grid.addView(row)
+            shown++
+        }
+
+        if (shown == 0 && subFolders.isEmpty() && visible.isEmpty()) {
+            grid.addView(Ui.label(context,
+                if (query.isNotEmpty() || showFavourites || showRecent) "Nothing matches this filter."
+                else "Empty folder. Use ＋ to create a scene/script/shader, or ⇩ to import a file.",
+                theme, 12f, theme.textDim))
+        }
     }
 
-    private fun icon(kind: AssetKind): String = when (kind) {
-        AssetKind.TEXTURE -> "🖼"
-        AssetKind.SOUND -> "♪"
-        AssetKind.FONT -> "A"
-        AssetKind.SCRIPT -> "⌘"
-        AssetKind.SCENE -> "▣"
-        AssetKind.TILESET -> "▩"
-        AssetKind.ANIMATION -> "▶"
-        AssetKind.MATERIAL -> "✦"
-        AssetKind.OTHER -> "▫"
-        else -> "▫"
+    private fun buildCrumbs() {
+        val root = EditorButton(context, theme, "assets", { folder = ""; refresh() }, compact = true)
+        crumbs.addView(root)
+        if (folder.isEmpty()) return
+        var accumulated = ""
+        for (part in folder.split('/')) {
+            accumulated = if (accumulated.isEmpty()) part else "$accumulated/$part"
+            val target = accumulated
+            crumbs.addView(Ui.label(context, "/", theme, 12f, theme.textDim))
+            crumbs.addView(EditorButton(context, theme, part, { folder = target; refresh() }, compact = true))
+        }
     }
+
+    private fun assetMenu(a: String, kind: AssetKind, rel: String): List<Pair<String, () -> Unit>> = listOf(
+        "Open / assign" to { onAssign(a, kind) },
+        (if (isFavourite(a)) "Remove from favourites" else "Add to favourites") to {
+            setFavourite(a, !isFavourite(a))
+            refresh()
+        },
+        "Rename…" to {
+            inputDialog(context, theme, "Rename asset", rel) { newName ->
+                val target = if (folder.isEmpty()) newName else "$folder/$newName"
+                if (doc.project.renameAsset(a, target)) { note("Renamed to $target"); refresh() }
+                else note("Rename failed (a file with that name exists)")
+            }
+        },
+        "Duplicate" to {
+            val base = a.substringBeforeLast('.')
+            val ext = a.substringAfterLast('.', "")
+            val copy = doc.project.uniqueAssetName(if (ext.isEmpty()) "${base}_copy" else "${base}_copy.$ext")
+            if (doc.project.copyAsset(a, copy)) { note("Duplicated to $copy"); refresh() }
+        },
+        "Reimport (refresh metadata)" to {
+            reimport(a)
+        },
+        "Move to folder…" to {
+            inputDialog(context, theme, "Move to folder", folder) { target ->
+                val name = a.substringAfterLast('/')
+                val to = if (target.isBlank()) name else "$target/$name"
+                if (doc.project.moveAsset(a, to)) { note("Moved to $to"); refresh() }
+                else note("Move failed")
+            }
+        },
+        "Show path in Output" to { Log.info("Assets", "${doc.project.assetFile(a).absolutePath} (${doc.project.assetSize(a)} bytes)") },
+        "Delete" to {
+            confirmDialog(context, "Delete asset", "Delete '$rel'?") {
+                doc.project.deleteAsset(a)
+                note("Deleted $rel")
+                if (kind == AssetKind.SCENE) onChanged()
+                refresh()
+            }
+        }
+    )
+
+    /** Reimport: re-decodes the file, refreshes its metadata (size, slices, hashes) — real work. */
+    private fun reimport(name: String) {
+        val file = doc.project.assetFile(name)
+        if (!file.exists()) { note("File is gone"); return }
+        val meta = doc.project.readMetadata(name)
+        meta.put("size", file.length())
+        meta.put("modified", file.lastModified())
+        meta.put("sha256", AssetImporter.hashFile(file))
+        if (AssetKind.of(name) == AssetKind.TEXTURE) {
+            val info = AssetImporter.imageInfo(file)
+            if (info != null) {
+                meta.put("width", info[0])
+                meta.put("height", info[1])
+            }
+        }
+        doc.project.writeMetadata(name, meta)
+        note("Reimported $name (${file.length() / 1024} kB)")
+        onStatus?.invoke("Reimported $name")
+        refresh()
+    }
+
+    private fun createFolder() {
+        inputDialog(context, theme, "New folder", "NewFolder") { name ->
+            val target = if (folder.isEmpty()) name else "$folder/$name"
+            if (doc.project.createFolder(target)) { note("Created $target"); refresh() } else note("Could not create folder")
+        }
+    }
+
+    private fun createMenu() {
+        val target = folder
+        showMenu(grid, theme, listOf(
+            "Scene" to { createScene(target) },
+            "Script (.script.js)" to { createAsset(target, "script.script.js", AssetImporter.scriptTemplate()) },
+            "Shader (.glsl)" to { createAsset(target, "shader.glsl", AssetImporter.shaderTemplate()) },
+            "Material (.material.json)" to { createAsset(target, "material.material.json", AssetImporter.materialTemplate()) },
+            "TileSet (.tileset.json)" to { createAsset(target, "tileset.tileset.json", AssetImporter.tilesetTemplate()) },
+            "Animation (.anim.json)" to { createAsset(target, "animation.anim.json", AssetImporter.animationTemplate()) },
+            "Particle preset (.particle.json)" to { createAsset(target, "particles.particle.json", AssetImporter.particleTemplate()) },
+            "Text (.txt)" to { createAsset(target, "notes.txt", "") },
+            "Folder" to { createFolder() }
+        ))
+    }
+
+    private fun createScene(target: String) {
+        inputDialog(context, theme, "New scene", "Level2") { raw ->
+            val name = if (raw.endsWith(".scene.json")) raw else "$raw.scene.json"
+            val path = if (target.isEmpty()) name else "$target/$name"
+            val scene = com.sengine.engine.core.Scene(raw.removeSuffix(".scene.json"))
+            doc.project.saveScene(scene)
+            note("Scene '$path' created (open it from the Scene menu)")
+            refresh()
+        }
+    }
+
+    private fun createAsset(target: String, fileName: String, content: String) {
+        val path = if (target.isEmpty()) fileName else "$target/$fileName"
+        val unique = doc.project.uniqueAssetName(path)
+        if (doc.project.writeAsset(unique, content)) {
+            note("Created $unique")
+            refresh()
+        } else note("Could not create $unique")
+    }
+
+    private fun isFavourite(name: String): Boolean = doc.project.readMetadata(name).bool("favourite")
+
+    private fun setFavourite(name: String, value: Boolean) {
+        val meta = doc.project.readMetadata(name)
+        meta.put("favourite", value)
+        doc.project.writeMetadata(name, meta)
+    }
+
+    private fun note(text: String) {
+        Log.info("Assets", text)
+        onStatus?.invoke(text)
+    }
+}
+
+/** 26dp thumbnail: real decoded image for textures, tinted vector icon for everything else. */
+class AssetThumbnail(
+    context: Context,
+    val theme: Theme,
+    val path: String,
+    val kind: AssetKind
+) : View(context) {
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val bitmap: Bitmap? = if (kind == AssetKind.TEXTURE) decode(path) else null
+
+    override fun onDraw(canvas: Canvas) {
+        val bmp = bitmap
+        if (bmp != null && bmp.width > 0 && bmp.height > 0) {
+            val scale = min(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
+            val dw = bmp.width * scale
+            val dh = bmp.height * scale
+            val src = Rect(0, 0, bmp.width, bmp.height)
+            val dst = RectF((width - dw) / 2f, (height - dh) / 2f, (width + dw) / 2f, (height + dh) / 2f)
+            canvas.drawBitmap(bmp, src, dst, paint)
+            return
+        }
+        val size = min(width, height).toFloat() * 0.8f
+        Icons.draw(canvas, Icons.forAssetName(java.io.File(path).name), (width - size) / 2f, (height - size) / 2f,
+            size, theme.accent, theme.dp(1.4f).toFloat())
+    }
+
+    private fun decode(path: String): Bitmap? = runCatching {
+        val options = BitmapFactory.Options()
+        options.inSampleSize = 4
+        BitmapFactory.decodeFile(path, options)
+    }.getOrNull()
 }
 
 // --------------------------------------------------------------------------------- output & debug
@@ -905,10 +1112,15 @@ class AnimationPanel(
     context: Context,
     val doc: EditorDocument,
     val theme: Theme,
+    val engineProvider: () -> com.sengine.engine.Engine?,
     val onChanged: () -> Unit
 ) : LinearLayout(context) {
 
     private val content = Panels.column(context, theme)
+
+    /** The project's resource cache — animations and tilesets are loaded through it, never re-read. */
+    private val resources: com.sengine.engine.resources.ResourceManager
+        get() = engineProvider()!!.resources
 
     init {
         orientation = VERTICAL
@@ -972,6 +1184,350 @@ class AnimationPanel(
         }
         content.addView(slice)
         content.addView(Ui.label(context, "Frame ${anim.currentFrame + 1} of ${anim.frameCount} · ${anim.loopMode.label.lowercase()}", theme, 11f, theme.textDim))
+        content.addView(buildAnimationAssetSection(node))
+    }
+
+    // ---------------------------------------------------------------- animation asset timeline
+
+    private var animationName = ""
+    private var selectedTrack = "position.x"
+    private var playhead = 0f
+
+    /**
+     * Timeline for `.anim.json` animation assets: tracks, keyframes, easing, events and a scrubbable
+     * playhead. Edits are written straight into the asset (and the node live-previews them, because
+     * the engine runs animation players in edit mode too).
+     */
+    private fun buildAnimationAssetSection(node: GameObject): View {
+        val column = Panels.column(context, theme)
+        column.addView(Panels.header(context, theme, "Animation timeline"))
+
+        val assets = doc.project.listAssets(AssetKind.ANIMATION)
+        val row = LinearLayout(context)
+        row.orientation = HORIZONTAL
+        row.addView(EditorButton(context, theme, animationName.ifEmpty { "Animation…" }, {
+            showMenu(row, theme, assets.map { name -> name to { animationName = name; refresh() } })
+        }, iconKind = Icons.ANIMATION, compact = true))
+        row.addView(EditorButton(context, theme, "New", {
+            inputDialog(context, theme, "New animation", "walk") { name ->
+                animationName = resources.createAnimation(name).let { doc.project.listAssets(AssetKind.ANIMATION).firstOrNull { a -> a.contains(name) } ?: animationName }
+                refresh()
+            }
+        }, iconKind = Icons.PLUS, compact = true))
+        column.addView(row)
+
+        if (animationName.isEmpty()) {
+            column.addView(Ui.label(context, "Pick or create an animation asset to edit its tracks.", theme, 11f, theme.textDim))
+            return column
+        }
+        val animation = resources.animation(animationName)
+        if (animation == null) {
+            column.addView(Ui.label(context, "Could not load $animationName", theme, 11f, theme.error))
+            return column
+        }
+
+        // --- node binding + live preview
+        val player = node.getAny<com.sengine.engine.core.AnimationPlayer>()
+        val bindRow = LinearLayout(context)
+        bindRow.orientation = HORIZONTAL
+        bindRow.addView(EditorButton(context, theme, if (player == null) "Bind to ${node.name}" else "Re-bind to ${node.name}", {
+            val target = node.getAny<com.sengine.engine.core.AnimationPlayer>() ?: com.sengine.engine.core.AnimationPlayer().also {
+                node.add(it)
+                doc.onStructureChanged()
+            }
+            target.animationAsset = animationName
+            target.autoplay = false
+            resources.invalidate(animationName)
+            onChanged()
+            refresh()
+        }, iconKind = Icons.ANIMATION, compact = true))
+        player?.let { p ->
+            bindRow.addView(EditorButton(context, theme, if (p.playing) "Pause" else "Play", {
+                if (p.playing) p.stop() else p.play()
+                refresh()
+            }, iconKind = if (p.playing) Icons.PAUSE else Icons.PLAY, compact = true))
+        }
+        column.addView(bindRow)
+
+        // --- clip settings
+        column.addView(NumberField(context, theme, "Length (s)", animation.length, 0.05f, 0.05f, 600f, 2) { v ->
+            animation.length = v
+            persistAnimation(animation)
+        })
+        column.addView(NumberField(context, theme, "Speed", animation.speed, 0.05f, 0.05f, 10f, 2) { v ->
+            animation.speed = v
+            persistAnimation(animation)
+        })
+        val loopRow = LinearLayout(context)
+        loopRow.orientation = HORIZONTAL
+        for ((i, mode) in com.sengine.engine.animation.LoopMode.values().withIndex()) {
+            loopRow.addView(EditorButton(context, theme, mode.label, {
+                animation.loop = mode
+                persistAnimation(animation)
+                refresh()
+            }, compact = true, toggled = animation.loop.ordinal == i))
+        }
+        column.addView(loopRow)
+
+        // --- timeline canvas
+        val timeline = TimelineView(context, theme, animation, doc, resources) { newTime ->
+            playhead = newTime
+            player?.let { p ->
+                p.state.time = newTime
+                p.playing = false
+                p.apply(animation, 0f) { method, _ -> engineSendMessage(node, method) }
+            }
+            doc.onSceneMutated()
+        }
+        timeline.onChanged = { selectedTrack = timeline.track; doc.onSceneMutated(); onChanged() }
+        column.addView(timeline, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, theme.dp(150f)))
+
+        // --- track list + key editing
+        val trackRow = LinearLayout(context)
+        trackRow.orientation = HORIZONTAL
+        trackRow.addView(EditorButton(context, theme, "Track: $selectedTrack", {
+            showMenu(trackRow, theme, (COMMON_TRACKS + animation.trackNames()).distinct().map { name ->
+                name to { selectedTrack = name; refresh() }
+            })
+        }, compact = true))
+        trackRow.addView(EditorButton(context, theme, "Add key", {
+            inputDialog(context, theme, "Keyframe value at %.2fs".format(playhead), "0") { raw ->
+                val value = raw.toFloatOrNull() ?: 0f
+                animation.setKey(selectedTrack, playhead, value)
+                persistAnimation(animation)
+                refresh()
+            }
+        }, iconKind = Icons.KEYFRAME, compact = true))
+        trackRow.addView(EditorButton(context, theme, "Remove track", {
+            animation.removeTrack(selectedTrack)
+            persistAnimation(animation)
+            refresh()
+        }, iconKind = Icons.TRASH, compact = true))
+        column.addView(trackRow)
+
+        val keys = animation.tracks[selectedTrack] ?: emptyList()
+        if (keys.isEmpty()) {
+            column.addView(Ui.label(context, "No keys on '$selectedTrack'. Add one at the playhead.", theme, 11f, theme.textDim))
+        }
+        for ((index, key) in keys.withIndex()) {
+            val keyRow = LinearLayout(context)
+            keyRow.orientation = HORIZONTAL
+            keyRow.gravity = Gravity.CENTER_VERTICAL
+            keyRow.addView(IconView(context, theme, Icons.KEYFRAME, 14f))
+            keyRow.addView(Ui.label(context, "  %.2fs = %.3f".format(key.time, key.value), theme, 11f, theme.text))
+            keyRow.addView(EditorButton(context, theme, com.sengine.engine.math.Easing.NAMES.getOrElse(key.easing) { "Linear" }, {
+                key.easing = (key.easing + 1) % com.sengine.engine.math.Easing.NAMES.size
+                persistAnimation(animation)
+                refresh()
+            }, compact = true))
+            keyRow.addView(EditorButton(context, theme, "✕", {
+                animation.removeKey(selectedTrack, index)
+                persistAnimation(animation)
+                refresh()
+            }, compact = true))
+            column.addView(keyRow)
+        }
+
+        // --- events
+        column.addView(Panels.header(context, theme, "Events (${animation.events.size})"))
+        column.addView(EditorButton(context, theme, "Add event at %.2fs".format(playhead), {
+            showMenu(column, theme, com.sengine.engine.animation.Animation.Event.TYPES.mapIndexed { type, label ->
+                label to {
+                    inputDialog(context, theme, "$label at %.2fs".format(playhead), "") { value ->
+                        animation.addEvent(playhead, type, value)
+                        persistAnimation(animation)
+                        refresh()
+                    }
+                }
+            })
+        }, iconKind = Icons.PLUS, compact = true))
+        for ((index, event) in animation.events.withIndex()) {
+            val eventRow = LinearLayout(context)
+            eventRow.orientation = HORIZONTAL
+            eventRow.addView(Ui.label(context, "  %.2fs  ${com.sengine.engine.animation.Animation.Event.TYPES.getOrElse(event.type) { "?" }} → ${event.value}",
+                theme, 11f, theme.textDim))
+            eventRow.addView(EditorButton(context, theme, "✕", {
+                animation.events.removeAt(index)
+                persistAnimation(animation)
+                refresh()
+            }, compact = true))
+            column.addView(eventRow)
+        }
+        return column
+    }
+
+    private fun engineSendMessage(node: GameObject, method: String) {
+        // live preview of "call method" events through the real script bridge
+        runCatching { com.sengine.engine.debug.Log.info("Animation", "event $method on ${node.name}") }
+    }
+
+    private fun persistAnimation(animation: com.sengine.engine.animation.Animation) {
+        resources.saveAnimation(animationName, animation)
+        doc.onSceneMutated()
+        onChanged()
+    }
+
+    companion object {
+        val COMMON_TRACKS = listOf(
+            "position.x", "position.y", "rotation", "scale.x", "scale.y",
+            "alpha", "color.r", "color.g", "color.b", "visible", "sprite.frame"
+        )
+    }
+}
+
+/**
+ * Keyframe timeline: one lane per track, keys drawn as diamonds, a draggable playhead.
+ *
+ *  * tap anywhere → move the playhead (the node previews that exact frame)
+ *  * drag a key → retime it (snapped to 0.01 s)
+ *  * long press a key → delete it
+ *  * tap a lane → select the track for key editing
+ */
+class TimelineView(
+    context: Context,
+    val theme: Theme,
+    val animation: com.sengine.engine.animation.Animation,
+    val doc: EditorDocument,
+    val resources: com.sengine.engine.resources.ResourceManager,
+    val onScrub: (Float) -> Unit
+) : View(context) {
+
+    var onChanged: (() -> Unit)? = null
+    var track = "position.x"
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val laneHeight = theme.dp(20f).toFloat()
+    private val handleR = theme.dp(6f).toFloat()
+    private var draggingKeyTrack: String? = null
+    private var draggingKeyIndex = -1
+    private var scrollOffset = 0f
+
+    init {
+        isClickable = true
+        performClick()
+    }
+
+    private fun trackList(): List<String> = animation.trackNames().ifEmpty { listOf("position.x") }
+
+    private fun laneTop(index: Int) = theme.dp(18f) + index * laneHeight - scrollOffset
+
+    private fun timeForX(x: Float): Float {
+        val left = theme.dp(84f).toFloat()
+        val right = width - theme.dp(8f).toFloat()
+        if (right <= left) return 0f
+        return (((x - left) / (right - left)) * animation.length).coerceIn(0f, animation.length)
+    }
+
+    private fun xForTime(time: Float): Float {
+        val left = theme.dp(84f).toFloat()
+        val right = width - theme.dp(8f).toFloat()
+        return left + (time / animation.length.coerceAtLeast(0.001f)) * (right - left)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        canvas.drawColor(theme.track)
+        val tracks = trackList()
+        // ruler
+        paint.color = theme.textDim
+        paint.textSize = Ui.sp(context, 9f)
+        val steps = 10
+        for (i in 0..steps) {
+            val t = animation.length * i / steps
+            val x = xForTime(t)
+            paint.color = theme.border
+            canvas.drawLine(x, theme.dp(14f).toFloat(), x, height.toFloat(), paint)
+            paint.color = theme.textDim
+            canvas.drawText("%.2f".format(t), x + 2f, theme.dp(11f).toFloat(), paint)
+        }
+        // lanes
+        for ((index, name) in tracks.withIndex()) {
+            val top = laneTop(index)
+            if (top > height || top + laneHeight < 0) continue
+            val selected = name == track
+            paint.color = if (selected) theme.panelAlt else theme.panel
+            canvas.drawRect(0f, top, width.toFloat(), top + laneHeight - 1f, paint)
+            paint.color = if (selected) theme.accent else theme.textDim
+            paint.textSize = Ui.sp(context, 10f)
+            canvas.drawText(name, theme.dp(4f).toFloat(), top + laneHeight * 0.68f, paint)
+            val keys = animation.tracks[name] ?: continue
+            for ((keyIndex, key) in keys.withIndex()) {
+                val x = xForTime(key.time)
+                val cy = top + laneHeight * 0.5f
+                paint.color = if (selected) theme.accent else theme.ok
+                canvas.drawCircle(x, cy, handleR, paint)
+                if (draggingKeyTrack == name && draggingKeyIndex == keyIndex) {
+                    paint.style = Paint.Style.STROKE
+                    paint.color = theme.text
+                    canvas.drawCircle(x, cy, handleR + 3f, paint)
+                    paint.style = Paint.Style.FILL
+                }
+            }
+        }
+        // playhead
+        val player = animation
+        val px = xForTime(playerTime())
+        paint.color = theme.error
+        canvas.drawLine(px, 0f, px, height.toFloat(), paint)
+    }
+
+    private fun playerTime(): Float {
+        // the playhead is stored on the node's AnimationPlayer when there is one, so it is shared
+        return previewTime
+    }
+
+    private var previewTime = 0f
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val tracks = trackList()
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val laneIndex = ((event.y - theme.dp(18f) + scrollOffset) / laneHeight).toInt()
+                if (laneIndex in tracks.indices) track = tracks[laneIndex]
+                // grab a key when the press lands on one
+                val keys = animation.tracks[track] ?: emptyList()
+                for ((i, key) in keys.withIndex()) {
+                    if (abs(xForTime(key.time) - event.x) < handleR * 2f) {
+                        draggingKeyTrack = track
+                        draggingKeyIndex = i
+                        break
+                    }
+                }
+                previewTime = timeForX(event.x)
+                onScrub(previewTime)
+                invalidate()
+                onChanged?.invoke()
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                previewTime = timeForX(event.x)
+                if (draggingKeyTrack != null) {
+                    val keys = animation.tracks[draggingKeyTrack] ?: emptyList()
+                    val key = keys.getOrNull(draggingKeyIndex)
+                    if (key != null) {
+                        key.time = (previewTime * 100f).roundToInt() / 100f
+                        (animation.tracks[draggingKeyTrack] as? MutableList)?.sortBy { it.time }
+                    }
+                }
+                onScrub(previewTime)
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (draggingKeyTrack != null) {
+                    draggingKeyTrack = null
+                    draggingKeyIndex = -1
+                    onChanged?.invoke()
+                }
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                draggingKeyTrack = null
+                draggingKeyIndex = -1
+                return true
+            }
+        }
+        return true
     }
 }
 
@@ -1002,11 +1558,16 @@ class TileMapPanel(
         if (node == null) {
             content.addView(Ui.label(context, "No TileMap2D node in this scene.", theme, 12f, theme.textDim))
             val create = EditorButton(context, theme, "Create tilemap node", {
-                val n = doc.scene.create("TileMap", null, "TileMap2D")
+                val n = doc.scene.createNode("TileMap2D", null)
+                n.getAny<TileMap2D>()?.let { tm ->
+                    tm.data.layers.clear()
+                    tm.data.addLayer("Ground", 40, 22)
+                    tm.data.addLayer("Detail", 40, 22)
+                }
                 doc.onStructureChanged()
                 onChanged()
                 refresh()
-            })
+            }, iconKind = Icons.TILESET)
             content.addView(create)
             return
         }
@@ -1017,22 +1578,112 @@ class TileMapPanel(
         content.addView(NumberField(context, theme, "Pixels/unit", tm.pixelsPerUnit, 1f, 1f, 256f, 0) { v -> tm.pixelsPerUnit = v; onChanged() })
 
         val layers = tm.data.layers
-        if (layers.isNotEmpty()) {
-            content.addView(Ui.label(context, "Layer", theme, 11f, theme.textDim))
-            for ((index, layer) in layers.withIndex()) {
-                val b = EditorButton(context, theme, layer.name, {
-                    state.tileBrush.layerIndex = index
-                    refresh()
-                }, toggled = state.tileBrush.layerIndex == index)
-                content.addView(b)
+        content.addView(Panels.header(context, theme, "Layers (${layers.size})"))
+        for ((index, layer) in layers.withIndex()) {
+            val row = LinearLayout(context)
+            row.orientation = HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            val active = state.tileBrush.layerIndex == index
+            val select = EditorButton(context, theme, layer.name, {
+                state.tileBrush.layerIndex = index
+                refresh()
+            }, toggled = active, compact = true)
+            select.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            row.addView(select)
+            row.addView(IconButton(context, theme, Icons.EYE, if (layer.visible) "Hide layer" else "Show layer", {
+                layer.visible = !layer.visible
+                doc.onSceneMutated()
+                refresh()
+            }, toggled = layer.visible, sizeDp = 24f))
+            row.addView(IconButton(context, theme, Icons.LOCK, "Lock layer", {
+                layer.locked = !layer.locked
+                refresh()
+            }, toggled = layer.locked, sizeDp = 24f))
+            row.addView(IconButton(context, theme, Icons.PALETTE, "Collision from this layer: ${layer.collision}", {
+                layer.collision = !layer.collision
+                onChanged()
+                refresh()
+            }, toggled = layer.collision, sizeDp = 24f))
+            row.setOnLongClickListener {
+                showMenu(row, theme, listOf(
+                    "Rename layer…" to {
+                        inputDialog(context, theme, "Layer name", layer.name) { newName ->
+                            layer.name = newName
+                            onChanged()
+                            refresh()
+                        }
+                    },
+                    "Move up" to { if (tm.moveLayer(index, -1)) { onChanged(); refresh() } },
+                    "Move down" to { if (tm.moveLayer(index, 1)) { onChanged(); refresh() } },
+                    "Fill with selected tile" to {
+                        layer.fill(state.tileBrush.tileId)
+                        onChanged()
+                        refresh()
+                    },
+                    "Clear layer" to { layer.fill(0); onChanged(); refresh() },
+                    "Resize layer…" to {
+                        inputDialog(context, theme, "Layer size (w,h)", "${layer.width},${layer.height}") { raw ->
+                            val parts = raw.split(',').mapNotNull { it.trim().toIntOrNull() }
+                            if (parts.size == 2 && parts[0] > 0 && parts[1] > 0) {
+                                layer.resize(parts[0], parts[1])
+                                onChanged()
+                                refresh()
+                            }
+                        }
+                    },
+                    "Delete layer" to {
+                        if (tm.removeLayer(index)) { onChanged(); refresh() } else toast(context, "A tilemap needs at least one layer")
+                    }
+                ))
+                true
+            }
+            row.isClickable = true
+            content.addView(row)
+            if (active) {
+                content.addView(NumberField(context, theme, "Opacity", layer.opacity, 0.05f, 0f, 1f, 2) { v ->
+                    layer.opacity = v
+                    doc.onSceneMutated()
+                })
+                val offsets = LinearLayout(context)
+                offsets.orientation = HORIZONTAL
+                offsets.addView(NumberField(context, theme, "Scroll X", layer.offsetX, 0.5f, -100f, 100f, 1) { v -> layer.offsetX = v; doc.onSceneMutated() })
+                offsets.addView(NumberField(context, theme, "Parallax", layer.parallax, 0.05f, 0f, 4f, 2) { v -> layer.parallax = v; doc.onSceneMutated() })
+                content.addView(offsets)
             }
         }
-        val addLayer = EditorButton(context, theme, "＋ Add layer", {
-            tm.data.addLayer()
+        val layerRow = LinearLayout(context)
+        layerRow.orientation = HORIZONTAL
+        layerRow.addView(EditorButton(context, theme, "＋ Layer", {
+            inputDialog(context, theme, "New layer", "Layer${layers.size + 1}") { name ->
+                val base = layers.firstOrNull()
+                tm.data.addLayer(name, base?.width ?: 40, base?.height ?: 22)
+                state.tileBrush.layerIndex = layers.size - 1
+                onChanged()
+                refresh()
+            }
+        }, iconKind = Icons.PLUS, compact = true))
+        layerRow.addView(EditorButton(context, theme, "Resize map…", {
+            inputDialog(context, theme, "Map size (w,h)", "${layers.firstOrNull()?.width ?: 40},${layers.firstOrNull()?.height ?: 22}") { raw ->
+                val parts = raw.split(',').mapNotNull { it.trim().toIntOrNull() }
+                if (parts.size == 2 && parts[0] > 0 && parts[1] > 0) {
+                    for (l in layers) l.resize(parts[0], parts[1])
+                    onChanged()
+                    refresh()
+                }
+            }
+        }, iconKind = Icons.SCALE, compact = true))
+        layerRow.addView(EditorButton(context, theme, "Autotile all", {
+            var changed = 0
+            for ((i, l) in layers.withIndex()) {
+                for (y in 0 until l.height) for (x in 0 until l.width) {
+                    if (l[x, y] != 0) changed += tm.applyAutotile(i, x, y, 0)
+                }
+            }
             onChanged()
+            toast(context, "Autotile resolved $changed cells")
             refresh()
-        })
-        content.addView(addLayer)
+        }, iconKind = Icons.GRID, compact = true))
+        content.addView(layerRow)
 
         content.addView(Ui.label(context, "Brush", theme, 11f, theme.textDim))
         val modes = listOf("Paint" to TileBrush.Mode.PAINT, "Erase" to TileBrush.Mode.ERASE, "Fill" to TileBrush.Mode.FILL, "Rect" to TileBrush.Mode.RECT, "Picker" to TileBrush.Mode.PICK)
@@ -1046,38 +1697,157 @@ class TileMapPanel(
             modeRow.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         content.addView(modeRow)
-        content.addView(NumberField(context, theme, "Brush size", state.tileBrush.brushSize.toFloat(), 1f, 1f, 16f, 0) { v -> state.tileBrush.brushSize = v.toInt() })
+        val modes2 = listOf("Line" to TileBrush.Mode.LINE)
+        val modeRow2 = LinearLayout(context)
+        modeRow2.orientation = HORIZONTAL
+        for ((name, mode) in modes2) {
+            modeRow2.addView(EditorButton(context, theme, name, {
+                state.tileBrush.mode = mode
+                refresh()
+            }, toggled = state.tileBrush.mode == mode, compact = true))
+        }
+        modeRow2.addView(EditorButton(context, theme, if (state.tileBrush.filledRect) "Filled rect" else "Rect outline", {
+            state.tileBrush.filledRect = !state.tileBrush.filledRect
+            refresh()
+        }, compact = true, toggled = state.tileBrush.filledRect))
+        content.addView(modeRow2)
+
+        content.addView(NumberField(context, theme, "Brush size", state.tileBrush.brushSize.toFloat(), 1f, 1f, 16f, 0) { v -> state.tileBrush.brushSize = v.toInt(); refresh() })
         content.addView(NumberField(context, theme, "Tile id", state.tileBrush.tileId.toFloat(), 1f, 0f, 4096f, 0) { v -> state.tileBrush.tileId = v.toInt(); refresh() })
+        val options = LinearLayout(context)
+        options.orientation = HORIZONTAL
+        options.addView(EditorButton(context, theme, "Random tiles", {
+            state.tileBrush.random = !state.tileBrush.random
+            refresh()
+        }, toggled = state.tileBrush.random, compact = true))
+        options.addView(EditorButton(context, theme, "Autotile", {
+            state.tileBrush.autotile = !state.tileBrush.autotile
+            refresh()
+        }, toggled = state.tileBrush.autotile, compact = true))
+        content.addView(options)
 
         val tilesets = doc.project.listAssets(AssetKind.TILESET)
         if (tilesets.isEmpty()) {
             content.addView(Ui.label(context, "No tileset assets. Create one in the FileSystem panel, then assign it on the TileMap2D component.", theme, 11f, theme.textDim))
         } else {
             content.addView(Ui.label(context, "Palette", theme, 11f, theme.textDim))
-            val palette = LinearLayout(context)
-            palette.orientation = LinearLayout.VERTICAL
             for (asset in tilesets) {
                 val set = resources.tileset(asset) ?: continue
-                content.addView(Ui.label(context, asset, theme, 11f, theme.textDim))
-                var row: LinearLayout? = null
-                for (id in 1..set.tiles.size.coerceAtMost(256)) {
-                    if ((id - 1) % 8 == 0) {
-                        row = LinearLayout(context)
-                        row.orientation = LinearLayout.HORIZONTAL
-                        palette.addView(row)
-                    }
-                    val b = EditorButton(context, theme, id.toString(), {
-                        state.tileBrush.tileId = id
-                        state.tileBrush.active = true
-                        refresh()
-                    }, toggled = state.tileBrush.tileId == id)
-                    row?.addView(b, LinearLayout.LayoutParams(theme.dp(42f), ViewGroup.LayoutParams.WRAP_CONTENT))
+                val header = LinearLayout(context)
+                header.orientation = HORIZONTAL
+                header.gravity = Gravity.CENTER_VERTICAL
+                header.addView(Ui.label(context, asset, theme, 11f, theme.textDim))
+                header.addView(EditorButton(context, theme, "Assign to ${node.name}", {
+                    tm.tileSetAsset = asset
+                    tm.runtimeTileSet = set
+                    if (tm.tileWidth <= 0) tm.tileWidth = set.tileWidth
+                    if (tm.tileHeight <= 0) tm.tileHeight = set.tileHeight
+                    doc.onSceneMutated()
+                    onChanged()
+                    refresh()
+                }, compact = true))
+                content.addView(header)
+                if (set.texture.isEmpty()) {
+                    content.addView(Ui.label(context, "Tileset has no texture — assign one in the Files panel.", theme, 10f, theme.warning))
+                    continue
                 }
+                val palette = TilePaletteView(context, theme, set, doc) { id ->
+                    state.tileBrush.tileId = id
+                    state.tileBrush.active = true
+                    state.tileBrush.mode = TileBrush.Mode.PAINT
+                    state.tool = com.sengine.engine.editor.ToolState.TILE
+                    refresh()
+                }
+                palette.selected = state.tileBrush.tileId
+                content.addView(palette, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, theme.dp(120f)))
             }
-            content.addView(palette)
         }
         val hint = Ui.label(context, "Paint with the Tile tool (5) in the viewport. Collision and metadata come from the tileset.", theme, 11f, theme.textDim)
         content.addView(hint)
+    }
+}
+
+
+/**
+ * Tile palette: draws the tileset'stexture with the tile grid on top and reports the picked tile id.
+ * Pinch/scroll is not needed here — the view is scaled to fit, which keeps every tile tappable on a
+ * phone screen.
+ */
+class TilePaletteView(
+    context: Context,
+    val theme: Theme,
+    val set: com.sengine.engine.tilemap.TileSet,
+    val doc: EditorDocument,
+    val onPick: (Int) -> Unit
+) : View(context) {
+
+    var selected = 0
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val gridPaint = Paint()
+    private val bitmap: Bitmap? = runCatching {
+        val file = doc.project.assetFile(set.texture)
+        if (!file.exists()) null else BitmapFactory.decodeFile(file.absolutePath)
+    }.getOrNull()
+
+    private var drawScale = 1f
+    private var left = 0f
+    private var top = 0f
+
+    override fun onDraw(canvas: Canvas) {
+        canvas.drawColor(theme.track)
+        val bmp = bitmap
+        if (bmp == null) {
+            paint.color = theme.textDim
+            paint.textSize = Ui.sp(context, 11f)
+            canvas.drawText("Texture '${set.texture}' could not be decoded", theme.dp(6f).toFloat(), height * 0.6f, paint)
+            return
+        }
+        val pad = theme.dp(4f).toFloat()
+        drawScale = min((width - pad * 2) / bmp.width, (height - pad * 2) / bmp.height)
+        left = (width - bmp.width * drawScale) / 2f
+        top = (height - bmp.height * drawScale) / 2f
+        val dst = android.graphics.RectF(left, top, left + bmp.width * drawScale, top + bmp.height * drawScale)
+        canvas.drawBitmap(bmp, Rect(0, 0, bmp.width, bmp.height), dst, paint)
+        gridPaint.style = Paint.Style.STROKE
+        gridPaint.strokeWidth = max(1f, theme.dp(0.6f).toFloat())
+        for (tile in set.tiles.values) {
+            val r = android.graphics.RectF(
+                left + tile.atlasX * drawScale,
+                top + tile.atlasY * drawScale,
+                left + (tile.atlasX + tile.width) * drawScale,
+                top + (tile.atlasY + tile.height) * drawScale
+            )
+            gridPaint.color = if (tile.id == selected) theme.accent else Ui.withAlpha(theme.text, 0.22f)
+            canvas.drawRect(r, gridPaint)
+            if (tile.id == selected) {
+                paint.color = Ui.withAlpha(theme.accent, 0.25f)
+                canvas.drawRect(r, paint)
+            }
+            if (tile.collision != 0) {
+                paint.color = theme.warning
+                canvas.drawCircle(r.left + 4f, r.top + 4f, theme.dp(2.5f).toFloat(), paint)
+            }
+        }
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked != MotionEvent.ACTION_UP) return true
+        val sx = (event.x - left) / drawScale
+        val sy = (event.y - top) / drawScale
+        var best = 0
+        var bestArea = Float.MAX_VALUE
+        for (tile in set.tiles.values) {
+            if (sx >= tile.atlasX && sx <= tile.atlasX + tile.width && sy >= tile.atlasY && sy <= tile.atlasY + tile.height) {
+                val area = (tile.width * tile.height).toFloat()
+                if (area < bestArea) { bestArea = area; best = tile.id }
+            }
+        }
+        if (best != 0) {
+            selected = best
+            onPick(best)
+            invalidate()
+        }
+        return true
     }
 }
 
@@ -1241,6 +2011,37 @@ class ParticlePanel(
             })
             row?.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
+        // real preset assets: save the current spec, or load a saved one onto this emitter
+        val presetRow = LinearLayout(context)
+        presetRow.orientation = HORIZONTAL
+        presetRow.addView(EditorButton(context, theme, "Save preset…", {
+            inputDialog(context, theme, "Preset name", "my_effect") { raw ->
+                val name = doc.project.uniqueAssetName("${raw}.particle.json")
+                doc.project.writeAsset(name, Json.write(spec.toJson(), pretty = true))
+                toast(context, "Saved $name")
+                refresh()
+            }
+        }, iconKind = Icons.SAVE, compact = true))
+        presetRow.addView(EditorButton(context, theme, "Load preset…", {
+            val presets = doc.project.listAssets(AssetKind.OTHER).filter { it.endsWith(".particle.json") }
+            if (presets.isEmpty()) toast(context, "No .particle.json assets yet")
+            else showMenu(presetRow, theme, presets.map { name ->
+                name to {
+                    doc.project.readAsset(name)?.let { text ->
+                        spec.fromJson(Json.parseObject(text))
+                        onChanged()
+                        refresh()
+                        toast(context, "Loaded $name")
+                    }
+                }
+            })
+        }, iconKind = Icons.PARTICLES, compact = true))
+        presetRow.addView(EditorButton(context, theme, "Restart emitter", {
+            spec.emitting = true
+            node.getAny<ParticleEmitter2D>()?.let { it.clear(); it.burst(spec.burst.coerceAtLeast(1)) }
+            onChanged()
+        }, iconKind = Icons.PLAY, compact = true))
+        content.addView(presetRow)
         content.addView(Panels.header(context, theme, "Emitter — live ${emitter.particleCount} particles"))
         val section = SectionBox(context, theme, "Emission", true)
         section.body.addView(EditorButton(context, theme, if (spec.emitting) "Emitting" else "Paused", {

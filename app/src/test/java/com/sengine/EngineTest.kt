@@ -19,9 +19,11 @@ import com.sengine.engine.core.Scene
 import com.sengine.engine.core.Sprite2D
 import com.sengine.engine.core.TileMap2D
 import com.sengine.engine.core.UnknownComponent
+import com.sengine.engine.debug.RemoteInspector
 import com.sengine.engine.editor.CreateNodeCommand
 import com.sengine.engine.editor.EditorDocument
 import com.sengine.engine.editor.NodeProps
+import com.sengine.engine.editor.TileStroke
 import com.sengine.engine.editor.TransformCommand
 import com.sengine.engine.input.InputMap
 import com.sengine.engine.input.InputSystem
@@ -33,6 +35,8 @@ import com.sengine.engine.particles.ParticlePresets
 import com.sengine.engine.particles.ParticleSpec
 import com.sengine.engine.particles.ParticleSystem
 import com.sengine.engine.physics.PhysicsWorld
+import com.sengine.engine.export.ApkExporter
+import com.sengine.engine.export.AssetImporter
 import com.sengine.engine.project.Project
 import com.sengine.engine.project.ProjectManager
 import com.sengine.engine.project.Templates
@@ -371,6 +375,37 @@ class EngineTest {
     }
 
     @Test
+    fun continuousCollisionStopsFastBodies() {
+        fun shoot(continuous: Boolean): Float {
+            val scene = Scene("Bullet")
+            scene.settings.gravityY = 0f
+            val wall = scene.create("Wall")
+            wall.add(Collider2D()).apply { width = 0.2f; height = 6f }
+            wall.setPosition(5f, 0f)
+            wall.computeWorld()
+            val bullet = scene.create("Bullet")
+            bullet.add(Rigidbody2D()).apply {
+                bodyType = BodyType.DYNAMIC
+                this.continuous = continuous
+                startVx = 60f
+            }
+            bullet.add(Collider2D()).apply { width = 0.2f; height = 0.2f }
+            bullet.setPosition(0f, 0f)
+            bullet.computeWorld()
+            bullet.getAny<Rigidbody2D>()!!.vx = 60f
+            val physics = PhysicsWorld()
+            physics.gravityY = 0f
+            physics.step(scene, 1f / 60f)   // 1 unit of travel in a single step
+            physics.step(scene, 1f / 60f)
+            return bullet.x
+        }
+        // continuous bodies are swept, so they never pass through a thin wall
+        val stopped = shoot(continuous = true)
+        assertTrue("continuous body tunneled: x=$stopped", stopped < 5.2f)
+        assertTrue("continuous body never moved: x=$stopped", stopped > 2f)
+    }
+
+    @Test
     fun physicsQueriesFindBodies() {
         val scene = Scene("Queries")
         val target = scene.create("Target")
@@ -665,6 +700,223 @@ class EngineTest {
         assertTrue("hero y=${hero.y}", hero.y < 5f)
         assertTrue("camera cx=${engine.gameView.cx}", engine.gameView.cx > -1f)
         assertTrue(engine.profiler.samples > 0)
+
+        // the debugger reads the game through a read-only snapshot
+        val snapshot = RemoteInspector.snapshot(engine)
+        assertEquals(engine.scene.objects.size, snapshot.arr("nodes").count())
+        assertEquals(engine.scene.name, snapshot.str("scene"))
+        assertEquals("PLAY", snapshot.str("mode"))
+        val heroJson = RemoteInspector.findNode(snapshot, hero.id)
+        assertNotNull(heroJson)
+        assertEquals("Hero", heroJson!!.str("name"))
+        assertTrue(heroJson.obj("transform")!!.f("x") == hero.x)
+        assertTrue(heroJson.arr("components").count() >= 2)
+        val stats = snapshot.obj("stats")!!
+        assertTrue(stats.fields.size > 10)
+        assertEquals(engine.renderList.stats.drawCalls, stats.i("drawCalls"))
+        assertTrue(stats.f("memoryMax") > 0f)
+        // hidden nodes are reported as hidden, and the tree text lists real names
+        hero.visible = false
+        val hidden = RemoteInspector.findNode(RemoteInspector.snapshot(engine), hero.id)!!
+        assertFalse(hidden.bool("visible"))
+        val text = RemoteInspector.treeText(engine)
+        assertTrue(text.contains("Hero"))
+        assertTrue(text.contains("Camera"))
         engine.release()
+    }
+
+    // ------------------------------------------------------------------ tile editing
+
+    @Test
+    fun tileBrushPaintFillLineAndAutotile() {
+        val scene = Scene("TileTest")
+        val mapNode = scene.createNode(NodeType.TILEMAP, null)
+        val map = mapNode.getAny<TileMap2D>()!!
+        map.tileWidth = 16
+        map.tileHeight = 16
+        map.pixelsPerUnit = 16f
+        map.data.layers.clear()
+        map.data.addLayer("Ground", 12, 8)
+        map.data.addLayer("Detail", 12, 8)
+
+        // a 3x3 brush centred on (5,3) writes 9 cells
+        assertEquals(9, map.paintBrush(0, 5, 3, 7, size = 3))
+        assertEquals(7, map.currentTile(0, 5, 3))
+        assertEquals(7, map.currentTile(0, 4, 2))
+        assertEquals(0, map.currentTile(0, 5, 0))
+        // painting the same tile again is a no-op, so the undo diff stays clean
+        assertEquals(0, map.paintBrush(0, 5, 3, 7, size = 3))
+
+        // lines and rectangles are real Bresenham/rect writes
+        assertEquals(6, map.drawLine(1, 0, 0, 5, 0, 3))
+        assertEquals(3, map.currentTile(1, 3, 0))
+        assertEquals(12, map.drawRect(0, 0, 0, 5, 1, 5, filled = true))
+        assertEquals(5, map.currentTile(0, 4, 1))
+
+        // flood fill replaces a connected region and leaves the rest alone
+        map.data.layers[1].fill(2)
+        val filled = map.floodFill(1, 0, 0, 9)
+        assertEquals(96, filled)
+        assertEquals(9, map.currentTile(1, 11, 7))
+
+        // terrain/autotile: tiles that declare a terrain group resolve their mask variants
+        val set = TileSet("terrain")
+        val lone = set.createTile(0, 0)
+        lone.terrainGroup = "grass"
+        lone.tags = "mask:*"
+        val masked = set.createTile(16, 0)
+        masked.terrainGroup = "grass"
+        masked.tags = "mask:2"           // right neighbour only
+        map.runtimeTileSet = set
+        map.data.layers[2 - 1].fill(0)
+        map.setTile(0, 4, 4, lone.id)
+        map.setTile(0, 5, 4, lone.id)
+        val resolved = map.applyAutotile(0, 4, 4, radius = 1)
+        assertTrue("resolved=$resolved", resolved > 0)
+        assertEquals(masked.id, map.currentTile(0, 4, 4))
+
+        // layers can be added, reordered and removed
+        val index = map.addLayer("Extra", 4, 4)
+        assertEquals(2, index)
+        assertTrue(map.moveLayer(2, -1))
+        assertEquals("Extra", map.data.layers[1].name)
+        assertTrue(map.removeLayer(1))                                            // drop "Extra"
+        assertEquals(2, map.data.layers.size)
+        assertTrue(map.removeLayer(0))                                            // drop "Ground"
+        assertEquals(1, map.data.layers.size)
+        assertFalse(map.removeLayer(0))                                           // never removes the last layer
+    }
+
+    @Test
+    fun tileStrokeUndoRestoresEditedCells() {
+        val scene = Scene("TileUndo")
+        val node = scene.createNode(NodeType.TILEMAP, null)
+        val map = node.getAny<TileMap2D>()!!
+        map.tileWidth = 16
+        map.tileHeight = 16
+        map.pixelsPerUnit = 16f
+        map.data.layers.clear()
+        map.data.addLayer("Ground", 8, 8)
+        val project = Project(tempDir("tile-undo-project"))
+        project.saveMeta()
+        val doc = EditorDocument(project, scene)
+
+        val stroke = TileStroke(node.id, "Ground", 8)
+        for (x in 0 until 4) {
+            val before = map.currentTile(0, x, 2)
+            map.setTile(0, x, 2, 4)
+            stroke.record(map.data.layers[0].index(x, 2), before, map.currentTile(0, x, 2))
+        }
+        assertEquals(4, stroke.size)
+        val command = stroke.toCommand("Paint tiles")!!
+        doc.undo.push(doc, command, execute = false)
+        assertTrue(doc.undo.canUndo)
+        for (x in 0 until 4) assertEquals(4, map.currentTile(0, x, 2))
+        doc.undo.undo(doc)
+        for (x in 0 until 4) assertEquals(0, map.currentTile(0, x, 2))
+        doc.undo.redo(doc)
+        assertEquals(4, map.currentTile(0, 3, 2))
+    }
+
+    // ------------------------------------------------------------------ project files & export
+
+    @Test
+    fun projectFolderOperationsAndAssetMetadata() {
+        val dir = tempDir("folders")
+        val project = Project(dir)
+        project.saveMeta()
+        assertTrue(project.createFolder("sprites"))
+        assertTrue(project.createFolder("sprites/enemies"))
+        assertEquals(listOf("sprites"), project.listFolders())
+        assertEquals(listOf("enemies"), project.listFolders("sprites"))
+
+        project.writeAsset("sprites/enemies/slime.script.js", AssetImporter.scriptTemplate())
+        val assets = project.listAssetsRecursive()
+        assertTrue(assets.contains("sprites/enemies/slime.script.js"))
+        assertTrue(project.moveAsset("sprites/enemies/slime.script.js", "sprites/slime.script.js"))
+        assertFalse(project.assetExists("sprites/enemies/slime.script.js"))
+
+        // import pipeline records real metadata
+        val sha = AssetImporter.hashFile(project.assetFile("sprites/slime.script.js"))
+        assertEquals(64, sha.length)
+        val meta = project.readMetadata("sprites/slime.script.js")
+        meta.put("sha256", sha)
+        meta.put("favourite", true)
+        project.writeMetadata("sprites/slime.script.js", meta)
+        assertTrue(project.readMetadata("sprites/slime.script.js").bool("favourite"))
+
+        // a real 1x1 PNG header is parsed without decoding pixels
+        val png = byteArrayOf(
+            0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0, 0, 0, 0x14,                // width  = 20  (bytes 16..19)
+            0, 0, 0, 0x0A                 // height = 10  (bytes 20..23)
+        )
+        val pngFile = File(project.assetsDir, "hero.png")
+        pngFile.writeBytes(png)
+        val info = AssetImporter.imageInfo(pngFile)
+        assertNotNull(info)
+        assertEquals(20, info!![0])
+        assertEquals(10, info[1])
+
+        assertTrue(project.deleteFolder("sprites"))
+        assertFalse(File(project.assetsDir, "sprites").exists())
+    }
+
+    @Test
+    fun exportWritesBuildableAndroidProject() {
+        val dir = tempDir("export-src")
+        val project = Project(dir)
+        project.saveMeta()
+        val scene = Scene("Main")
+        scene.createNode("Sprite2D", null)
+        project.saveScene(scene)
+        project.writeAsset("hero.png", "not-a-real-png")
+        project.writeAsset("hero.script.js", AssetImporter.scriptTemplate())
+        project.settings.name = "Hero Game"
+        project.settings.startScene = "Main"
+        project.settings.windowWidth = 960
+        project.settings.windowHeight = 540
+        project.settings.orientation = 1
+        project.saveMeta()
+
+        val out = File(tempDir("export-out"), "out")
+        val projectDir = ApkExporter.generateProject(project, out, "Hero Game", "com.sengine.games.herogame")
+
+        assertTrue(File(projectDir, "settings.gradle.kts").exists())
+        assertTrue(File(projectDir, "build.gradle.kts").exists())
+        assertTrue(File(projectDir, "gradle.properties").exists())
+        assertTrue(File(projectDir, "app/build.gradle.kts").exists())
+        val manifest = File(projectDir, "app/src/main/AndroidManifest.xml").readText()
+        assertTrue(manifest.contains("SEnginePlayerActivity"))
+        assertTrue(manifest.contains("android.hardware" .replace("android.hardware", "uses-feature")))
+        val gradle = File(projectDir, "app/build.gradle.kts").readText()
+        assertTrue(gradle.contains("com.sengine.games.herogame"))
+        assertTrue(manifest.contains("portrait"))
+        val player = File(projectDir, "app/src/main/java/com/sengine/games/herogame/SEnginePlayerActivity.kt")
+        assertTrue(player.exists())
+        assertTrue(player.readText().contains("GameActivity"))
+
+        // game data travels with the export: scenes, assets and settings
+        val gameDir = File(projectDir, "app/src/main/assets/game")
+        assertTrue(File(gameDir, "scenes/Main.scene.json").exists())
+        assertTrue(File(gameDir, "assets/hero.png").exists())
+        assertTrue(File(gameDir, "assets/hero.script.js").exists())
+        assertTrue(File(gameDir, "project.json").exists())
+        val exportMeta = Json.parseObject(File(gameDir, "export.json").readText())
+        assertEquals("Hero Game", exportMeta.str("name"))
+        assertEquals("Main", exportMeta.str("startScene"))
+
+        // a signing key is created once and reused, so upgrades keep installing
+        val keystore = File(project.dir, "export/keystore.jks")
+        assertTrue(keystore.exists())
+        val stamp = keystore.lastModified()
+        ApkExporter.generateProject(project, out, "Hero Game", "com.sengine.games.herogame")
+        assertEquals(stamp, keystore.lastModified())
+
+        // with no template and no gradle, the exporter still reports what it produced
+        val result = ApkExporter.export(null, project, "Hero Game", "com.sengine.games.herogame", runGradle = false)
+        assertEquals(ApkExporter.Stage.PROJECT_ONLY, result.stage)
+        assertNull(result.apk)
+        assertTrue(result.message.contains("Android project"))
     }
 }

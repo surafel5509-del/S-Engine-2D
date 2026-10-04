@@ -306,6 +306,50 @@ class Project(val dir: File) {
 
     fun assetSize(assetName: String): Long = assetFile(assetName).length()
 
+    // ------------------------------------------------------------------ folders
+
+    /** Sub-folder names directly inside [parent] (empty string = the assets root). */
+    fun listFolders(parent: String = ""): List<String> {
+        val dir = if (parent.isEmpty()) assetsDir else File(assetsDir, parent)
+        val files = dir.listFiles() ?: return emptyList()
+        return files.filter { it.isDirectory && !it.name.startsWith('.') }.map { it.name }.sorted()
+    }
+
+    fun createFolder(path: String): Boolean {
+        if (path.isBlank()) return false
+        val dir = File(assetsDir, path)
+        if (dir.exists()) return false
+        return dir.mkdirs()
+    }
+
+    fun deleteFolder(path: String): Boolean {
+        if (path.isBlank()) return false
+        val dir = File(assetsDir, path)
+        if (!dir.exists()) return false
+        if (!dir.canonicalPath.startsWith(assetsDir.canonicalPath)) return false
+        return dir.deleteRecursively()
+    }
+
+    /** Moves a folder (and everything in it) to another path inside `assets`. */
+    fun moveFolder(from: String, to: String): Boolean {
+        if (from.isBlank() || to.isBlank() || from == to) return false
+        val source = File(assetsDir, from)
+        val target = File(assetsDir, to)
+        if (!source.exists() || target.exists()) return false
+        if (target.parentFile?.exists() == false) target.parentFile?.mkdirs()
+        return source.renameTo(target)
+    }
+
+    /** Moves a single asset file, creating the destination folder when needed. */
+    fun moveAsset(assetName: String, toName: String): Boolean {
+        val source = assetFile(assetName)
+        if (!source.exists() || assetName == toName) return false
+        val target = assetFile(toName)
+        if (target.exists()) return false
+        target.parentFile?.mkdirs()
+        return source.renameTo(target)
+    }
+
     /** Sidecar metadata for the import pipeline (imported date, pivot, slices, atlas info). */
     fun metadataFile(assetName: String) = File(assetsDir, ".$assetName.meta.json")
 

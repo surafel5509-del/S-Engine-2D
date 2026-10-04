@@ -55,7 +55,16 @@ class EditorActivity : Activity(), EditorDocument.Listener {
     private var tilemap: TileMapPanel? = null
     private var shaders: ShaderPanel? = null
     private var particles: ParticlePanel? = null
+    private var spriteEditor: SpriteEditorPanel? = null
+    private var audioPanel: AudioPanel? = null
+    private var scriptEditor: ScriptEditorPanel? = null
+    private lateinit var audio: com.sengine.platform.android.AndroidAudio
+    private var exportPanel: ExportPanel? = null
+    private var inputPanel: InputMapPanel? = null
 
+    /** Panel containers, rebuilt on orientation change (portrait stacks everything under the view). */
+    private var dockTabs = ArrayList<TabStrip>()
+    private var dockStack: FrameLayout? = null
     private lateinit var root: LinearLayout
     private lateinit var centerColumn: LinearLayout
     private lateinit var leftDock: LinearLayout
@@ -63,13 +72,18 @@ class EditorActivity : Activity(), EditorDocument.Listener {
     private lateinit var bottomDock: LinearLayout
     private lateinit var statusBar: TextView
     private lateinit var titleBar: TextView
-    private var leftWidth = 240
-    private var rightWidth = 300
+    private lateinit var toolLabel: TextView
+    private lateinit var zoomLabel: TextView
+    private lateinit var runButton: EditorButton
+    private var leftWidth = 250
+    private var rightWidth = 310
     private var bottomHeight = 190
+    private var landscape = true
     private val handler = Handler(Looper.getMainLooper())
     private var autosaveTick = Runnable { autosave() }
     private var playing = false
     private var importedAssetKind: AssetKind = AssetKind.OTHER
+    private val toolButtons = ArrayList<Pair<IconButton, () -> Boolean>>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -88,6 +102,11 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         doc.openSceneNames = project.listScenes().toMutableList()
         doc.listeners.add(this)
         engine = Engine(project, doc.scene)
+        // the editor previews audio through the same mixer the game uses
+        audio = com.sengine.platform.android.AndroidAudio(this) { name ->
+            project.assetFile(name).takeIf { it.exists() }
+        }
+        engine.audio.backend = audio
         state = EditorState()
         state.showGrid = project.settings.showGrid
         state.gridStep = project.settings.gridStep
@@ -95,20 +114,83 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         state.snap.enabled = project.settings.snapEnabled
         state.pixelsPerUnit = 100f
 
+        val saved = AppState.editorLayout()
+        val parts = saved.split('|').mapNotNull { it.toIntOrNull() }
+        if (parts.size >= 3) {
+            leftWidth = parts[0]; rightWidth = parts[1]; bottomHeight = parts[2]
+        }
+
+        landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        buildPanels()
         buildUi()
         installRecovery()
         titleBar.text = title()
+        // frame the scene the moment the viewport has a size, so the editor never opens on empty sky
+        viewport.post { viewport.frameScene() }
         handler.postDelayed(autosaveTick, 30_000)
     }
 
     // ------------------------------------------------------------------ ui construction
 
+    /** Creates every panel once; [buildUi] decides where they live for the current orientation. */
+    private fun buildPanels() {
+        val refresh = { refreshPanels() }
+        sceneTree = SceneTreePanel(this, doc, theme, state, refresh, refresh, { showInspector() })
+        val assetPanel = AssetPanel(this, doc, theme, refresh, { name, kind -> assignAsset(name, kind) })
+        assetPanel.onImportRequested = { pickAsset() }
+        assetPanel.onOpen = { name -> openAssetInEditor(name) }
+        assetPanel.onStatus = { text -> if (::statusBar.isInitialized) statusBar.text = text else toast(this, text) }
+        assets = assetPanel
+        animation = AnimationPanel(this, doc, theme, { engine }, refresh)
+        tilemap = TileMapPanel(this, doc, theme, state, engine.resources, refresh)
+        spriteEditor = SpriteEditorPanel(this, doc, theme, refresh)
+        inspector = InspectorPanel(this, doc, theme, state, project, refresh)
+        particles = ParticlePanel(this, doc, theme, refresh)
+        shaders = ShaderPanel(this, doc, theme, refresh)
+        audioPanel = AudioPanel(this, doc, theme, engine, refresh)
+        scriptEditor = ScriptEditorPanel(this, doc, theme, engine, refresh)
+        exportPanel = ExportPanel(this, doc, theme, refresh)
+        inputPanel = InputMapPanel(this, doc, theme, { engine }, refresh)
+    }
+
     private fun buildUi() {
+        landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        dockTabs.clear()
+        toolButtons.clear()
         root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(theme.background)
         root.addView(buildTopBar())
 
+        val before = System.currentTimeMillis()
+        if (landscape) buildLandscape() else buildPortrait()
+        android.util.Log.i("SEngine", "editor layout built in ${System.currentTimeMillis() - before} ms (landscape=$landscape)")
+
+        statusBar = Ui.label(this, "Ready", theme, 11f, theme.textDim)
+        statusBar.isSingleLine = true
+        statusBar.ellipsize = android.text.TextUtils.TruncateAt.END
+        statusBar.setBackgroundColor(theme.panelAlt)
+        statusBar.setPadding(theme.pad(8f), theme.pad(3f), theme.pad(8f), theme.pad(3f))
+        root.addView(statusBar)
+        setContentView(root)
+
+        viewport = ViewportPanel(this, doc, engine, theme, state)
+        viewport.onStatus = { text -> statusBar.text = text }
+        viewport.onSelectionChanged = { refreshPanels(); updateStatus() }
+        viewport.onToolFinished = { text -> statusBar.text = text }
+        viewport.onZoomChanged = { updateStatus() }
+        viewport.onContextMenu = { sx, sy -> showViewportContextMenu(sx, sy) }
+        centerColumn.addView(buildViewportToolbar(), 0)
+        centerColumn.addView(viewport, 1,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        applyDockSizes()
+        refreshToolButtons()
+        updateStatus()
+    }
+
+    /** Landscape: three docks around the viewport (scene/files left, inspector right, console bottom). */
+    private fun buildLandscape() {
         val main = LinearLayout(this)
         main.orientation = LinearLayout.HORIZONTAL
         main.setBackgroundColor(theme.background)
@@ -116,7 +198,6 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         leftDock = LinearLayout(this)
         leftDock.orientation = LinearLayout.VERTICAL
         leftDock.setBackgroundColor(theme.panel)
-        val rightSplit = Splitter(this, theme, true) { delta -> rightWidth = (rightWidth - delta).coerceIn(180, 720); applyDockSizes() }
         centerColumn = LinearLayout(this)
         centerColumn.orientation = LinearLayout.VERTICAL
         rightDock = LinearLayout(this)
@@ -124,226 +205,326 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         rightDock.setBackgroundColor(theme.panel)
 
         main.addView(leftDock, LinearLayout.LayoutParams(theme.dp(leftWidth.toFloat()), ViewGroup.LayoutParams.MATCH_PARENT))
-        val leftSplit = Splitter(this, theme, true) { delta -> leftWidth = (leftWidth + delta).coerceIn(140, 560); applyDockSizes() }
-        main.addView(leftSplit)
+        main.addView(Splitter(this, theme, true) { delta -> leftWidth = (leftWidth + delta).coerceIn(170, 620); applyDockSizes() })
         main.addView(centerColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        main.addView(rightSplit)
+        main.addView(Splitter(this, theme, true) { delta -> rightWidth = (rightWidth - delta).coerceIn(220, 760); applyDockSizes() })
         main.addView(rightDock, LinearLayout.LayoutParams(theme.dp(rightWidth.toFloat()), ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(main, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        statusBar = Ui.label(this, "Ready", theme, 11f, theme.textDim)
-        statusBar.setBackgroundColor(theme.panelAlt)
-        root.addView(statusBar)
-
-        setContentView(root)
-
-        viewport = ViewportPanel(this, doc, engine, theme, state)
-        viewport.onStatus = { text -> statusBar.text = text }
-        viewport.onSelectionChanged = { refreshPanels() }
-        viewport.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-        centerColumn.addView(buildViewportToolbar())
-        centerColumn.addView(viewport)
-
-        val bottomSplit = Splitter(this, theme, false) { delta -> bottomHeight = (bottomHeight - delta).coerceIn(90, 620); applyDockSizes() }
-        centerColumn.addView(bottomSplit)
+        leftDock.addView(dockPanel(
+            listOf("Scene" to Icons.SCENE, "Files" to Icons.FOLDER, "Sprite" to Icons.CROP, "Anim" to Icons.ANIMATION, "Tiles" to Icons.TILESET),
+            listOf(sceneTree, assets, spriteEditor, animation, tilemap)
+        ))
+        rightDock.addView(dockPanel(
+            listOf("Inspector" to Icons.SETTINGS, "Script" to Icons.SCRIPT, "Input Map" to Icons.SELECT,
+                "Particles" to Icons.PARTICLES, "Shaders" to Icons.SHADER, "Audio" to Icons.SOUND, "Export" to Icons.PACKAGE),
+            listOf(inspector, scriptEditor, inputPanel, particles, shaders, audioPanel, exportPanel)
+        ))
         bottomDock = LinearLayout(this)
         bottomDock.orientation = LinearLayout.VERTICAL
         bottomDock.setBackgroundColor(theme.panel)
-        bottomDock.addView(buildBottomTabs())
+        val bottomSplit = Splitter(this, theme, false) { delta -> bottomHeight = (bottomHeight - delta).coerceIn(120, 700); applyDockSizes() }
+        centerColumn.addView(bottomSplit)
+        bottomDock.addView(dockPanel(
+            listOf("Output" to Icons.CONSOLE, "Debugger" to Icons.DEBUG, "Profiler" to Icons.PROFILE),
+            listOf(console)
+        ))
         centerColumn.addView(bottomDock, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, theme.dp(bottomHeight.toFloat())))
+    }
 
-        leftDock.addView(buildLeftDock())
-        rightDock.addView(buildRightDock())
-        applyDockSizes()
+    /**
+     * Portrait (or a narrow window): the viewport keeps the top half and every panel lives in one
+     * scrollable tab strip underneath, so nothing is squeezed into an unreadable column.
+     */
+    private fun buildPortrait() {
+        val main = LinearLayout(this)
+        main.orientation = LinearLayout.VERTICAL
+        main.setBackgroundColor(theme.background)
+        leftDock = LinearLayout(this)
+        leftDock.visibility = View.GONE
+        rightDock = LinearLayout(this)
+        rightDock.visibility = View.GONE
+        centerColumn = LinearLayout(this)
+        centerColumn.orientation = LinearLayout.VERTICAL
+        main.addView(leftDock)
+        main.addView(rightDock)
+        main.addView(centerColumn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(main, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        bottomDock = LinearLayout(this)
+        bottomDock.orientation = LinearLayout.VERTICAL
+        bottomDock.setBackgroundColor(theme.panel)
+        val bottomSplit = Splitter(this, theme, false) { delta -> bottomHeight = (bottomHeight - delta).coerceIn(160, 900); applyDockSizes() }
+        centerColumn.addView(bottomSplit)
+        bottomDock.addView(dockPanel(
+            listOf(
+                "Scene" to Icons.SCENE, "Files" to Icons.FOLDER, "Inspector" to Icons.SETTINGS,
+                "Sprite" to Icons.CROP, "Anim" to Icons.ANIMATION, "Tiles" to Icons.TILESET,
+                "Particles" to Icons.PARTICLES, "Shaders" to Icons.SHADER, "Audio" to Icons.SOUND,
+                "Script" to Icons.SCRIPT, "Input Map" to Icons.SELECT, "Export" to Icons.PACKAGE,
+                "Output" to Icons.CONSOLE, "Debugger" to Icons.DEBUG, "Profiler" to Icons.PROFILE
+            ),
+            listOf(sceneTree, assets, inspector, spriteEditor, animation, tilemap, particles, shaders, audioPanel,
+                scriptEditor, inputPanel, exportPanel, console)
+        ))
+        bottomDock.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, theme.dp(300f))
+        centerColumn.addView(bottomDock, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+    }
+
+    /** Tabs + stack for a group of panels. The stack keeps every panel alive and just toggles visibility. */
+    private fun dockPanel(names: List<Pair<String, Int>>, panels: List<View?>): View {
+        val tabs = TabStrip(this, theme)
+        val stack = FrameLayout(this)
+        val container = LinearLayout(this)
+        container.orientation = LinearLayout.VERTICAL
+        container.setBackgroundColor(theme.panel)
+        container.addView(tabs)
+        container.addView(stack, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val real = ArrayList<View>()
+        for (p in panels) {
+            if (p == null) continue
+            detach(p)
+            stack.addView(p, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            p.visibility = View.GONE
+            real.add(p)
+        }
+        stack.addView(Ui.label(this, "No panel here yet.", theme, 12f, theme.textDim).apply {
+            gravity = Gravity.CENTER
+        }, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        tabs.setTabItems(names)
+        tabs.onSelect = { index ->
+            for (i in 0 until stack.childCount) stack.getChildAt(i).visibility = if (i == index) View.VISIBLE else View.GONE
+            when (val panel = real.getOrNull(index.coerceIn(0, (real.size - 1).coerceAtLeast(0)))) {
+                is SceneTreePanel -> panel.refresh()
+                is AssetPanel -> panel.refresh()
+                is InspectorPanel -> panel.refresh()
+                is SpriteEditorPanel -> panel.refresh()
+                is AnimationPanel -> panel.refresh()
+                is TileMapPanel -> panel.refresh()
+                is ParticlePanel -> panel.refresh()
+                is ShaderPanel -> panel.refresh()
+                is AudioPanel -> panel.refresh()
+                is ScriptEditorPanel -> {}
+                is ExportPanel -> panel.refresh()
+                is InputMapPanel -> panel.refresh()
+                is ConsolePanel -> panel.refresh()
+            }
+        }
+        tabs.select(0)
+        tabs.onSelect?.invoke(0)
+        dockTabs.add(tabs)
+        container.tag = stack
+        if (dockStack == null) dockStack = stack
+        return container
+    }
+
+    private fun detach(view: View) {
+        (view.parent as? ViewGroup)?.removeView(view)
     }
 
     private fun buildTopBar(): View {
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.VERTICAL
         bar.setBackgroundColor(theme.panel)
+
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
         row.setPadding(theme.pad(6f), theme.pad(4f), theme.pad(6f), theme.pad(4f))
 
-        titleBar = Ui.label(this, "S ENGINE", theme, 14f, theme.accent, bold = true)
+        titleBar = Ui.label(this, "S ENGINE", theme, 13f, theme.accent, bold = true)
+        titleBar.isSingleLine = true
+        titleBar.ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
         titleBar.setOnClickListener { showSceneMenu(titleBar) }
         row.addView(titleBar)
 
-        fun menuButton(name: String, onClick: (View) -> Unit): View {
+        fun menuButton(name: String, icon: Int, onClick: (View) -> Unit): View {
             lateinit var button: EditorButton
-            button = EditorButton(this, theme, name, { onClick(button) })
-            button.setPadding(theme.pad(8f), theme.pad(2f), theme.pad(8f), theme.pad(2f))
+            button = EditorButton(this, theme, name, { onClick(button) }, iconKind = icon, compact = true)
+            button.setPadding(theme.pad(6f), theme.pad(2f), theme.pad(6f), theme.pad(2f))
             return button
         }
-        row.addView(menuButton("Scene") { showSceneMenu(it) })
-        row.addView(menuButton("Project") { showProjectMenu(it) })
-        row.addView(menuButton("Editor") { showEditorMenu(it) })
-        row.addView(menuButton("Debug") { showDebugMenu(it) })
-        val search = EditorButton(this, theme, "Search", { showCommandPalette() }, icon = "⌕")
+        row.addView(menuButton("Scene", Icons.SCENE) { showSceneMenu(it) })
+        row.addView(menuButton("Project", Icons.FOLDER) { showProjectMenu(it) })
+        row.addView(menuButton("Editor", Icons.SETTINGS) { showEditorMenu(it) })
+        row.addView(menuButton("Debug", Icons.DEBUG) { showDebugMenu(it) })
+        val search = EditorButton(this, theme, "Search", { showCommandPalette() }, iconKind = Icons.SEARCH, compact = true)
         row.addView(search)
+        toolbarItem(search, theme, "Command palette (Ctrl+Shift+P)")
         row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
 
-        val run = EditorButton(this, theme, if (playing) "Stop" else "Run", {
+        val save = IconButton(this, theme, Icons.SAVE, "Save scene", { saveScene() })
+        toolbarItem(save, theme, "Save scene (Ctrl+S)")
+        row.addView(save)
+        val undo = IconButton(this, theme, Icons.UNDO, "Undo", { if (doc.undo.undo(doc)) refreshPanels() })
+        toolbarItem(undo, theme, "Undo (Ctrl+Z)")
+        row.addView(undo)
+        val redo = IconButton(this, theme, Icons.REDO, "Redo", { if (doc.undo.redo(doc)) refreshPanels() })
+        toolbarItem(redo, theme, "Redo (Ctrl+Shift+Z)")
+        row.addView(redo)
+        row.addView(View(this), LinearLayout.LayoutParams(theme.dp(6f), 1))
+
+        runButton = EditorButton(this, theme, if (playing) "Stop" else "Run", {
             if (playing) stopPlay() else startPlay()
-        }, icon = if (playing) "■" else "▶")
-        row.addView(run)
+        }, iconKind = if (playing) Icons.STOP else Icons.PLAY, minWidthDp = 76f)
+        toolbarItem(runButton, theme, "Run the project in play mode (F5) / stop (F6)")
+        row.addView(runButton)
         bar.addView(row)
 
-        // toolbar strip
-        val tools = LinearLayout(this)
-        tools.orientation = LinearLayout.HORIZONTAL
-        tools.setPadding(theme.pad(6f), theme.pad(4f), theme.pad(6f), theme.pad(4f))
-        tools.setBackgroundColor(theme.panelAlt)
-        for (tool in ToolState.ALL) {
-            val b = EditorButton(this, theme, tool.label, {
-                state.tool = tool
-                toast(this, "${tool.label} tool (${tool.shortcut})")
-                refreshToolButtons()
-            }, toggled = state.tool == tool, icon = tool.icon)
-            tools.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
-        val toggles = ArrayList<Pair<String, () -> Unit>>()
-        toggles.add("Grid" to { state.showGrid = !state.showGrid })
-        toggles.add("Snap" to { state.snap.enabled = !state.snap.enabled })
-        toggles.add("Colliders" to { state.showColliders = !state.showColliders })
-        toggles.add("Guides" to { state.showGuides = !state.showGuides })
-        toggles.add("Physics" to { state.showPhysicsDebug = !state.showPhysicsDebug })
-        toggles.add("UI bounds" to { state.showUIBounds = !state.showUIBounds })
-        for ((name, action) in toggles) {
-            val b = EditorButton(this, theme, name, {
-                action()
-                refreshToolButtons()
-            }, toggled = when (name) {
-                "Grid" -> state.showGrid
-                "Snap" -> state.snap.enabled
-                "Colliders" -> state.showColliders
-                "Guides" -> state.showGuides
-                "Physics" -> state.showPhysicsDebug
-                else -> state.showUIBounds
-            })
-            tools.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            toolbarItem(b, theme, "Toggle $name overlay")
-        }
-        val focus = EditorButton(this, theme, "Focus", { viewport.focusSelection() }, icon = "◎")
-        tools.addView(focus)
-        bar.addView(tools)
-        toolbarItem(search, theme, "Command palette (Ctrl+Shift+P)")
-        toolbarItem(run, theme, "Run the project in play mode (F5) / stop (F6)")
+        bar.addView(buildToolStrip())
         return bar
     }
 
+    private fun buildToolStrip(): View {
+        val scroll = android.widget.HorizontalScrollView(this)
+        scroll.isHorizontalScrollBarEnabled = false
+        scroll.setBackgroundColor(theme.panelAlt)
+        val tools = LinearLayout(this)
+        tools.orientation = LinearLayout.HORIZONTAL
+        tools.gravity = Gravity.CENTER_VERTICAL
+        tools.setPadding(theme.pad(6f), theme.pad(4f), theme.pad(6f), theme.pad(4f))
+
+        tools.addView(Ui.label(this, "", theme, 12f, theme.text).also { toolLabel = it })
+
+        for (tool in ToolState.ALL) {
+            val b = IconButton(this, theme, Icons.forTool(tool), tool.label, {
+                state.tool = tool
+                viewport.cancelTool()
+                refreshToolButtons()
+                updateStatus()
+            })
+            toolbarItem(b, theme, "${tool.label} tool (${tool.shortcut})")
+            tools.addView(b)
+            toolButtons.add(b to { state.tool == tool })
+        }
+        tools.addView(divider())
+
+        val toggles: List<Triple<Int, String, () -> Unit>> = listOf(
+            Triple(Icons.GRID, "Grid", { state.showGrid = !state.showGrid }),
+            Triple(Icons.SNAP, "Snapping", { state.snap.enabled = !state.snap.enabled }),
+            Triple(Icons.COLLIDER, "Colliders", { state.showColliders = !state.showColliders }),
+            Triple(Icons.CAMERA, "Cameras", { state.showCameras = !state.showCameras }),
+            Triple(Icons.GUIDE, "Guides", { state.showGuides = !state.showGuides }),
+            Triple(Icons.TILESET, "Tile grid", { state.showTileGrid = !state.showTileGrid }),
+            Triple(Icons.PIXEL_GRID, "Pixel grid", { state.showPixelGrid = !state.showPixelGrid }),
+            Triple(Icons.PHYSICS, "Physics debug", { state.showPhysicsDebug = !state.showPhysicsDebug }),
+            Triple(Icons.UI_EDIT, "UI bounds", { state.showUIBounds = !state.showUIBounds }),
+            Triple(Icons.SOUND, "Audio areas", { state.showAudioAreas = !state.showAudioAreas })
+        )
+        for ((icon, name, action) in toggles) {
+            val b = IconButton(this, theme, icon, "Toggle $name overlay", { action(); refreshToolButtons() })
+            toolbarItem(b, theme, "Toggle $name overlay")
+            tools.addView(b)
+            toolButtons.add(b to { when (name) {
+                "Grid" -> state.showGrid
+                "Snapping" -> state.snap.enabled
+                "Colliders" -> state.showColliders
+                "Cameras" -> state.showCameras
+                "Guides" -> state.showGuides
+                "Tile grid" -> state.showTileGrid
+                "Pixel grid" -> state.showPixelGrid
+                "Physics debug" -> state.showPhysicsDebug
+                "UI bounds" -> state.showUIBounds
+                else -> state.showAudioAreas
+            } })
+        }
+        tools.addView(divider())
+        val focus = IconButton(this, theme, Icons.FOCUS, "Focus selection", { viewport.focusSelection() })
+        toolbarItem(focus, theme, "Focus selection in the viewport (F)")
+        tools.addView(focus)
+        val frameAll = IconButton(this, theme, Icons.WORLD, "Frame whole scene", { viewport.frameScene() })
+        toolbarItem(frameAll, theme, "Frame the whole scene")
+        tools.addView(frameAll)
+
+        scroll.addView(tools, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        return scroll
+    }
+
+    private fun divider(): View {
+        val v = View(this)
+        v.setBackgroundColor(theme.border)
+        v.layoutParams = LinearLayout.LayoutParams(theme.pad(1f), theme.dp(22f)).apply {
+            marginStart = theme.pad(6f)
+            marginEnd = theme.pad(6f)
+        }
+        return v
+    }
+
     private fun refreshToolButtons() {
+        for ((button, isOn) in toolButtons) {
+            button.toggled = isOn()
+            button.refresh()
+        }
+        toolLabel.text = "  ${state.tool.label}"
+        toolLabel.setTextColor(theme.accent)
         viewport.requestRender()
+        updateStatus()
+    }
+
+    private fun updateStatus() {
+        if (!::statusBar.isInitialized) return
+        val selected = state.selectionIds.size
+        val zoom = viewport.zoomPercent()
+        statusBar.text = "%s · %s · zoom %.0f%% · x %.2f  y %.2f%s".format(
+            doc.sceneName + if (doc.dirty) " *" else "",
+            if (selected == 0) "no selection" else "$selected selected",
+            zoom, state.mouseWorldX, state.mouseWorldY,
+            if (state.snap.enabled) " · snap ${state.snap.step}" else ""
+        )
+        zoomLabel.text = "%.0f%%".format(zoom)
     }
 
     private fun buildViewportToolbar(): View {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
         row.setBackgroundColor(theme.panel)
         row.setPadding(theme.pad(4f), theme.pad(3f), theme.pad(4f), theme.pad(3f))
-        row.addView(Ui.label(this, doc.sceneName, theme, 12f, theme.textDim))
+        val name = Ui.label(this, doc.sceneName, theme, 12f, theme.textDim)
+        name.isSingleLine = true
+        row.addView(name)
         row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        val preview = EditorButton(this, theme, "Resolution: ${EditorState.PREVIEW_SIZES[state.resolutionPreview].first}", {})
+
+        val zoomOut = IconButton(this, theme, Icons.ZOOM_OUT, "Zoom out", { viewport.zoomAtCenter(0.8f) })
+        toolbarItem(zoomOut, theme, "Zoom out")
+        row.addView(zoomOut)
+        zoomLabel = Ui.label(this, "100%", theme, 12f, theme.text)
+        zoomLabel.gravity = Gravity.CENTER
+        zoomLabel.setPadding(theme.pad(6f), 0, theme.pad(6f), 0)
+        zoomLabel.isClickable = true
+        zoomLabel.setOnClickListener { viewport.resetZoom() }
+        toolbarItem(zoomLabel, theme, "Zoom (tap to reset to 100%)")
+        row.addView(zoomLabel)
+        val zoomIn = IconButton(this, theme, Icons.ZOOM_IN, "Zoom in", { viewport.zoomAtCenter(1.25f) })
+        toolbarItem(zoomIn, theme, "Zoom in")
+        row.addView(zoomIn)
+        val fit = IconButton(this, theme, Icons.FOCUS, "Frame scene", { viewport.frameScene() })
+        toolbarItem(fit, theme, "Frame the whole scene")
+        row.addView(fit)
+
+        val preview = EditorButton(this, theme, EditorState.PREVIEW_SIZES[state.resolutionPreview].first, {}, iconKind = Icons.SCALE, compact = true)
         preview.setOnClickListener {
             showMenu(preview, theme, EditorState.PREVIEW_SIZES.mapIndexed { index, size ->
                 size.first to {
                     viewport.applyPreviewResolution(index)
-                    preview.setText("Resolution: ${size.first}")
+                    preview.setText(size.first)
+                    updateStatus()
                 }
             })
         }
+        toolbarItem(preview, theme, "Resolution preview")
         row.addView(preview)
-        val zoomIn = EditorButton(this, theme, "＋", { viewport.zoom(1.25f) })
-        val zoomOut = EditorButton(this, theme, "－", { viewport.zoom(0.8f) })
-        row.addView(zoomOut)
-        row.addView(zoomIn)
         return row
     }
 
-    private fun buildLeftDock(): View {
-        val tabs = TabStrip(this, theme)
-        tabs.setTabs(listOf("Scene", "FileSystem", "Animation", "TileMap"))
-        val container = LinearLayout(this)
-        container.orientation = LinearLayout.VERTICAL
-        container.addView(tabs)
-        val stack = FrameLayout(this)
-        container.addView(stack, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-
-        val tree = SceneTreePanel(this, doc, theme, state, { refreshPanels() }, { refreshPanels() }, { refreshPanels() })
-        sceneTree = tree
-        val assetPanel = AssetPanel(this, doc, theme, { refreshPanels() }, { name, kind -> assignAsset(name, kind) })
-        assetPanel.onImportRequested = { pickAsset() }
-        assets = assetPanel
-        animation = AnimationPanel(this, doc, theme) { refreshPanels() }
-        tilemap = TileMapPanel(this, doc, theme, state, engine.resources) { refreshPanels() }
-
-        stack.addView(tree)
-        stack.addView(assetPanel)
-        stack.addView(animation!!)
-        stack.addView(tilemap!!)
-        tabs.onSelect = { index ->
-            for (i in 0 until stack.childCount) stack.getChildAt(i).visibility = if (i == index) View.VISIBLE else View.GONE
-            when (index) {
-                0 -> sceneTree?.refresh()
-                1 -> assets?.refresh()
-                2 -> animation?.refresh()
-                3 -> tilemap?.refresh()
-            }
-        }
-        stack.getChildAt(1).visibility = View.GONE
-        stack.getChildAt(2).visibility = View.GONE
-        stack.getChildAt(3).visibility = View.GONE
-        return container
-    }
-
-    private fun buildRightDock(): View {
-        val inspectorPanel = InspectorPanel(this, doc, theme, state, project) { refreshPanels() }
-        inspector = inspectorPanel
-        val particlePanel = ParticlePanel(this, doc, theme) { refreshPanels() }
-        particles = particlePanel
-        val shaderPanel = ShaderPanel(this, doc, theme) { refreshPanels() }
-        shaders = shaderPanel
-        val tabs = TabStrip(this, theme)
-        tabs.setTabs(listOf("Inspector", "Particles", "Shaders"))
-        val container = LinearLayout(this)
-        container.orientation = LinearLayout.VERTICAL
-        container.addView(tabs)
-        val stack = FrameLayout(this)
-        container.addView(stack, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        stack.addView(inspectorPanel)
-        stack.addView(particlePanel)
-        stack.addView(shaderPanel)
-        stack.getChildAt(1).visibility = View.GONE
-        stack.getChildAt(2).visibility = View.GONE
-        tabs.onSelect = { index ->
-            for (i in 0 until stack.childCount) stack.getChildAt(i).visibility = if (i == index) View.VISIBLE else View.GONE
-            when (index) {
-                0 -> inspectorPanel.refresh()
-                1 -> particlePanel.refresh()
-                2 -> shaderPanel.refresh()
-            }
-        }
-        return container
-    }
-
-    private fun buildBottomTabs(): View {
-        val panel = ConsolePanel(this, theme, state) { engine }
-        console = panel
-        val tabs = TabStrip(this, theme)
-        tabs.setTabs(listOf("Output", "Debugger", "Profiler"))
-        tabs.onSelect = { index -> panel.refresh(index) }
-        val container = LinearLayout(this)
-        container.orientation = LinearLayout.VERTICAL
-        container.addView(tabs)
-        container.addView(panel)
-        return container
-    }
-
     private fun applyDockSizes() {
-        leftDock.layoutParams = LinearLayout.LayoutParams(theme.dp(leftWidth.toFloat()), ViewGroup.LayoutParams.MATCH_PARENT)
-        rightDock.layoutParams = LinearLayout.LayoutParams(theme.dp(rightWidth.toFloat()), ViewGroup.LayoutParams.MATCH_PARENT)
-        bottomDock.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, theme.dp(bottomHeight.toFloat()))
+        if (landscape) {
+            leftDock.layoutParams = LinearLayout.LayoutParams(theme.dp(leftWidth.toFloat()), ViewGroup.LayoutParams.MATCH_PARENT)
+            rightDock.layoutParams = LinearLayout.LayoutParams(theme.dp(rightWidth.toFloat()), ViewGroup.LayoutParams.MATCH_PARENT)
+            bottomDock.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, theme.dp(bottomHeight.toFloat()))
+        } else {
+            bottomDock.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
         leftDock.requestLayout()
         rightDock.requestLayout()
         bottomDock.requestLayout()
@@ -414,6 +595,7 @@ class EditorActivity : Activity(), EditorDocument.Listener {
                 toast(this, "Project settings reloaded")
             },
             "-" to {},
+            "Export APK / Android project…" to { selectDockTab("Export"); exportPanel?.refresh() },
             "Export project (.zip)…" to { exportProject() },
             "Import file into assets…" to { pickAsset() },
             "-" to {},
@@ -435,6 +617,13 @@ class EditorActivity : Activity(), EditorDocument.Listener {
             "Redo ${doc.undo.redoLabel}" to { if (doc.undo.redo(doc)) refreshPanels() },
             "-" to {},
             "Add node…" to { showAddNodeMenu(anchor) },
+            "Panels ▸ Sprite editor" to { selectDockTab("Sprite") },
+            "Panels ▸ Animation timeline" to { selectDockTab("Anim") },
+            "Panels ▸ Tilemap" to { selectDockTab("Tiles") },
+            "Panels ▸ Script editor" to { selectDockTab("Script") },
+            "Panels ▸ Particles" to { selectDockTab("Particles") },
+            "Panels ▸ Audio" to { selectDockTab("Audio") },
+            "Panels ▸ Export" to { selectDockTab("Export") },
             "Duplicate selection" to { duplicateSelection() },
             "Delete selection" to { deleteSelection() },
             "-" to {},
@@ -472,6 +661,15 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         ))
     }
 
+    /** Writes the live snapshot (nodes, transforms, physics, profiler) to the clipboard. */
+    private fun copyRemoteSnapshot() {
+        val snapshot = com.sengine.engine.debug.RemoteInspector.snapshot(engine)
+        val text = com.sengine.engine.json.Json.write(snapshot, true)
+        val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("S Engine snapshot", text))
+        toast(this, "Remote snapshot copied (${text.length} chars)")
+    }
+
     private fun showDebugMenu(anchor: View) {
         showMenu(anchor, theme, listOf(
             "Run (F5)" to { startPlay() },
@@ -491,6 +689,12 @@ class EditorActivity : Activity(), EditorDocument.Listener {
             "Reload scripts" to {
                 engine.scripts.reload()
                 toast(this, "Scripts reloaded")
+            },
+            "Copy remote snapshot" to { copyRemoteSnapshot() },
+            "Reload scripts" to { engine.scripts.reload(); toast(this, "Scripts reloaded") },
+            "Log scene tree" to {
+                com.sengine.engine.debug.Log.info("Debugger", com.sengine.engine.debug.RemoteInspector.treeText(engine, 80))
+                console?.refresh(1)
             }
         ))
     }
@@ -771,7 +975,29 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         project.saveMeta()
     }
 
+    /**
+     * The manifest handles rotation/size changes in-place, so the docks are reassembled here instead
+     * of letting Android recreate the activity: the document, undo history and GL state survive.
+     */
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val wasLandscape = landscape
+        val nowLandscape = newConfig.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        if (wasLandscape == nowLandscape) return
+        runCatching {
+            viewport.dispose()
+            buildUi()
+            applyDockSizes()
+            refreshToolButtons()
+            updateStatus()
+            viewport.post { viewport.requestRender() }
+        }.onFailure { e ->
+            com.sengine.engine.debug.Log.error("Editor", "Layout rebuild failed: ${e.message}")
+        }
+    }
+
     override fun onDestroy() {
+        runCatching { audio.release() }
         super.onDestroy()
         handler.removeCallbacks(autosaveTick)
         viewport.dispose()
@@ -806,6 +1032,87 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         inspector?.refresh()
         viewport.requestRender()
     }
+
+    /** Brings the Inspector tab to the front (used by the scene tree's "open inspector" action). */
+    private fun showInspector() {
+        selectDockTab("Inspector")
+    }
+
+    /** Selects a panel tab by name across every dock strip. */
+    private fun selectDockTab(name: String) {
+        for (tabs in dockTabs) {
+            val index = tabs.indexOf(name)
+            if (index >= 0) {
+                tabs.select(index)
+                return
+            }
+        }
+    }
+
+    /** Opens an asset with the editor that owns its type. */
+    private fun openAssetInEditor(name: String) {
+        when (AssetKind.of(name)) {
+            AssetKind.SCENE -> openScene(name)
+            AssetKind.SCRIPT -> {
+                selectDockTab("Script")
+                scriptEditor?.load(name)
+            }
+            AssetKind.MATERIAL -> {
+                selectDockTab("Shaders")
+                shaders?.refresh()
+            }
+            AssetKind.TILESET -> {
+                selectDockTab("Tiles")
+                tilemap?.refresh()
+            }
+            else -> {
+                selectDockTab("Sprite")
+                spriteEditor?.refresh()
+            }
+        }
+        statusBar.text = "Opened $name"
+    }
+
+    /** Long-press / right-click menu for the node under the cursor in the viewport. */
+    private fun showViewportContextMenu(sx: Float, sy: Float) {
+        val wx = state.view.screenToWorldX(sx)
+        val wy = state.view.screenToWorldY(sy)
+        val node = viewport.nodeAt(wx, wy)
+        val items = ArrayList<Pair<String, () -> Unit>>()
+        if (node != null) {
+            items.add("Select ${node.name}" to { viewport.focusNode(node.id) })
+            items.add("Rename '${node.name}'…" to {
+                inputDialog(this, theme, "Rename node", node.name) { newName ->
+                    doc.undo.push(doc, com.sengine.engine.editor.RenameNodeCommand("Rename node", node.id, newName))
+                    refreshPanels()
+                }
+            })
+            items.add("Duplicate" to { duplicateSelection() })
+            items.add((if (node.visible) "Hide" else "Show") to {
+                node.visible = !node.visible
+                doc.onSceneMutated()
+                refreshPanels()
+            })
+            items.add((if (node.locked) "Unlock" else "Lock") to {
+                node.locked = !node.locked
+                refreshPanels()
+            })
+            items.add("Focus" to { viewport.focusNode(node.id) })
+            items.add("Delete" to { deleteSelection() })
+            items.add("-" to {})
+        }
+        items.add("Frame scene" to { viewport.frameScene() })
+        items.add("Reset zoom" to { viewport.resetZoom() })
+        items.add("Add node here…" to {
+            val created = doc.scene.createNode(com.sengine.engine.core.NodeType.SPRITE, null)
+            created.setPosition(wx, wy)
+            doc.onStructureChanged()
+            viewport.focusNode(created.id)
+            refreshPanels()
+        })
+        showMenu(viewport, theme, items)
+    }
+
 
     // ------------------------------------------------------------------ command palette & keys
 
@@ -874,12 +1181,27 @@ class EditorActivity : Activity(), EditorDocument.Listener {
         "Delete Selection (Del)" to { deleteSelection() },
         "Duplicate Selection (Ctrl+D)" to { duplicateSelection() },
         "Import Asset…" to { pickAsset() },
-        "Export Project…" to { exportProject() },
+        "Export APK / project" to { selectDockTab("Export"); exportPanel?.refresh() },
+        "Export Project (.zip)…" to { exportProject() },
+        "Open Sprite Editor" to { selectDockTab("Sprite"); spriteEditor?.refresh() },
+        "Open Animation Timeline" to { selectDockTab("Anim"); animation?.refresh() },
+        "Open Tilemap Editor" to { selectDockTab("Tiles"); tilemap?.refresh() },
+        "Open Script Editor" to { selectDockTab("Script") },
+        "Open Particle Editor" to { selectDockTab("Particles"); particles?.refresh() },
+        "Open Audio Panel" to { selectDockTab("Audio"); audioPanel?.refresh() },
+        "Open Input Map" to { selectDockTab("Input Map"); inputPanel?.refresh() },
+        "Reset Zoom to 100%" to { viewport.setZoomPercent(100f); updateStatus() },
+        "Frame Scene" to { viewport.frameScene() },
+        "Tile brush: paint" to { state.tool = ToolState.TILE; state.tileBrush.mode = com.sengine.engine.tilemap.TileBrush.Mode.PAINT; refreshToolButtons() },
+        "Tile brush: erase" to { state.tool = ToolState.TILE; state.tileBrush.mode = com.sengine.engine.tilemap.TileBrush.Mode.ERASE; refreshToolButtons() },
+        "Tile brush: fill" to { state.tool = ToolState.TILE; state.tileBrush.mode = com.sengine.engine.tilemap.TileBrush.Mode.FILL; refreshToolButtons() },
         "Save Workspace Layout" to { AppState.saveEditorLayout("$leftWidth|$rightWidth|$bottomHeight") },
         "Back to Project Manager" to { startActivity(Intent(this, ProjectManagerActivity::class.java)); finish() }
     )
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        // "press any key to rebind" in the Input Map panel takes priority while it is capturing
+        if (inputPanel?.onKeyCaptured(keyCode) == true) return true
         val ctrl = event.isCtrlPressed
         when (keyCode) {
             KeyEvent.KEYCODE_S -> {
@@ -904,12 +1226,37 @@ class EditorActivity : Activity(), EditorDocument.Listener {
             KeyEvent.KEYCODE_F5, KeyEvent.KEYCODE_R -> { startPlay(); return true }
             KeyEvent.KEYCODE_F6 -> { stopPlay(); return true }
             KeyEvent.KEYCODE_F -> { viewport.focusSelection(); return true }
-            KeyEvent.KEYCODE_T -> { state.tool = ToolState.SCALE; return true }
+            KeyEvent.KEYCODE_T -> { state.tool = ToolState.SCALE; viewport.cancelTool(); refreshToolButtons(); return true }
             KeyEvent.KEYCODE_FORWARD_DEL, KeyEvent.KEYCODE_DEL -> { deleteSelection(); return true }
-            KeyEvent.KEYCODE_E -> { state.tool = ToolState.ROTATE; return true }
-            KeyEvent.KEYCODE_W -> { state.tool = ToolState.MOVE; return true }
-            KeyEvent.KEYCODE_Q -> { state.tool = ToolState.SELECT; return true }
-            KeyEvent.KEYCODE_ESCAPE -> { engine.stop(); playing = false; return true }
+            KeyEvent.KEYCODE_E -> { state.tool = ToolState.ROTATE; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_W -> { state.tool = ToolState.MOVE; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_Q -> { state.tool = ToolState.SELECT; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_Y -> { state.tool = ToolState.PIVOT; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_5 -> { state.tool = ToolState.TILE; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_6 -> { state.tool = ToolState.RECT; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_7 -> { state.tool = ToolState.UI; viewport.cancelTool(); refreshToolButtons(); return true }
+            KeyEvent.KEYCODE_G -> {
+                if (ctrl) { state.showGrid = !state.showGrid; refreshToolButtons(); return true }
+            }
+            KeyEvent.KEYCODE_EQUALS, KeyEvent.KEYCODE_PLUS, KeyEvent.KEYCODE_NUMPAD_ADD -> { viewport.zoomAtCenter(1.25f); updateStatus(); return true }
+            KeyEvent.KEYCODE_MINUS, KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> { viewport.zoomAtCenter(0.8f); updateStatus(); return true }
+            KeyEvent.KEYCODE_0 -> { viewport.resetZoom(); updateStatus(); return true }
+            KeyEvent.KEYCODE_ESCAPE -> {
+                if (playing) { stopPlay() } else { viewport.cancelTool() }
+                return true
+            }
+        }
+        if (!ctrl && !event.isAltPressed) {
+            // tools declare their own shortcut, so adding a tool automatically gives it a key
+            val label = KeyEvent.keyCodeToString(keyCode).removePrefix("KEYCODE_")
+            for (tool in ToolState.ALL) {
+                if (tool.shortcut.equals(label, ignoreCase = true)) {
+                    state.tool = tool
+                    viewport.cancelTool()
+                    refreshToolButtons()
+                    return true
+                }
+            }
         }
         return super.onKeyDown(keyCode, event)
     }

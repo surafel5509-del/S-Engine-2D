@@ -1,6 +1,8 @@
 package com.sengine.engine.debug
 
+import com.sengine.engine.Engine
 import com.sengine.engine.core.AnimationPlayer
+import com.sengine.engine.core.Area2D
 import com.sengine.engine.core.AudioSource
 import com.sengine.engine.core.Component
 import com.sengine.engine.core.GameObject
@@ -9,6 +11,9 @@ import com.sengine.engine.core.Rigidbody2D
 import com.sengine.engine.core.Scene
 import com.sengine.engine.core.TileMap2D
 import com.sengine.engine.input.InputSystem
+import com.sengine.engine.json.JVal
+import com.sengine.engine.json.jarr
+import com.sengine.engine.json.jobj
 import com.sengine.engine.physics.PhysicsWorld
 import com.sengine.engine.render.RenderStats
 import com.sengine.engine.ui.ControlComponent
@@ -331,6 +336,191 @@ object RemoteInspector {
             out.add((c.type + if (c.enabled) "" else " (disabled)") to text.toString().trim())
         }
         return out
+    }
+
+    // ------------------------------------------------------------------ structured snapshots
+
+    /**
+     * Serializable snapshot of a running game: engine stats, the whole node tree and runtime state
+     * (physics, animation, particles, UI rects). The editor shows it and can copy it into a bug
+     * report or write it next to the log — inspecting a game never mutates it.
+     */
+    fun snapshot(engine: Engine, includeProps: Boolean = true, maxNodes: Int = 2000): JVal.Obj {
+        val scene = engine.scene
+        val nodes = JVal.Arr()
+        var count = 0
+        for (go in scene.objects) {
+            if (count >= maxNodes) break
+            nodes.add(nodeJson(go, includeProps))
+            count++
+        }
+        return jobj(
+            "mode" to engine.mode.name,
+            "time" to engine.time,
+            "frame" to engine.frame,
+            "fps" to engine.fps,
+            "scene" to scene.name,
+            "revision" to scene.structureRevision.toLong(),
+            "nodeCount" to scene.objects.size,
+            "truncated" to (count < scene.objects.size),
+            "stats" to stats(engine),
+            "nodes" to nodes
+        )
+    }
+
+    /** Runtime state of a single node, in the same shape as one entry of [snapshot]. */
+    fun nodeJson(go: GameObject, includeProps: Boolean = true): JVal.Obj {
+        val components = JVal.Arr()
+        for (c in go.components) {
+            val props = JVal.Obj()
+            if (includeProps) {
+                for (p in c.props()) {
+                    if (p is com.sengine.engine.core.Prop.Info) continue
+                    runCatching { p.encode() }.getOrNull()?.let { props.fields[p.name] = it }
+                }
+            }
+            components.add(jobj("type" to c.type, "enabled" to c.enabled, "props" to props))
+        }
+
+        val runtime = JVal.Obj()
+        go.getAny<Rigidbody2D>()?.let { rb ->
+            runtime.put("physics", jobj(
+                "vx" to rb.vx, "vy" to rb.vy, "grounded" to rb.grounded, "onWall" to rb.onWall,
+                "onCeiling" to rb.onCeiling, "sleeping" to rb.sleeping,
+                "layer" to rb.collisionLayer, "mask" to rb.collisionMask
+            ))
+        }
+        go.getAny<com.sengine.engine.core.AnimatedSprite2D>()?.let { a ->
+            runtime.put("animation", jobj(
+                "asset" to a.animationAsset, "frame" to a.currentFrame, "playing" to a.playing,
+                "finished" to a.finished, "fps" to a.fps
+            ))
+        }
+        go.getAny<ParticleEmitter2D>()?.let { p ->
+            runtime.put("particles", jobj("count" to p.particleCount, "preset" to p.preset))
+        }
+        go.getAny<Area2D>()?.let { area -> runtime.put("area", jobj("overlapping" to area.overlapping.size)) }
+        go.getAny<ControlComponent>()?.let { control ->
+            runtime.put("ui", jobj(
+                "type" to control.ui.controlType,
+                "rect" to jarr(control.rect.x, control.rect.y, control.rect.width, control.rect.height)
+            ))
+        }
+
+        val groups = JVal.Arr()
+        go.groups.forEach { groups.add(JVal.Str(it)) }
+        val world = go.computeWorld()
+        return jobj(
+            "id" to go.id,
+            "name" to go.name,
+            "type" to go.type,
+            "parent" to (go.parent?.id ?: 0L),
+            "depth" to depthOf(go),
+            "tag" to go.tag,
+            "groups" to groups,
+            "active" to go.active,
+            "activeInHierarchy" to go.isActiveInHierarchy(),
+            "visible" to go.visible,
+            "locked" to go.locked,
+            "layer" to go.layer,
+            "order" to go.order,
+            "transform" to jobj(
+                "x" to go.x, "y" to go.y, "rotation" to go.rotation,
+                "scaleX" to go.scaleX, "scaleY" to go.scaleY,
+                "pivotX" to go.pivotX, "pivotY" to go.pivotY
+            ),
+            "world" to jobj("x" to world.tx, "y" to world.ty, "rotation" to world.rotationDeg),
+            "components" to components,
+            "runtime" to runtime,
+            "children" to go.children().size
+        )
+    }
+
+    /** Finds a node inside a snapshot by id (or by name, when [id] is 0). */
+    fun findNode(snapshot: JVal.Obj, id: Long, name: String = ""): JVal.Obj? {
+        for (item in snapshot.arr("nodes")) {
+            val o = item as? JVal.Obj ?: continue
+            if (id != 0L && o.l("id") == id) return o
+            if (id == 0L && name.isNotEmpty() && o.str("name") == name) return o
+        }
+        return null
+    }
+
+    /** Engine, renderer and memory numbers — the values the profiler tab plots. */
+    fun stats(engine: Engine): JVal.Obj {
+        val p = engine.profiler
+        val runtime = Runtime.getRuntime()
+        return jobj(
+            "fps" to p.smoothFps,
+            "frameMs" to p.frameMs.last(),
+            "updateMs" to p.updateMs.last(),
+            "physicsMs" to p.physicsMs.last(),
+            "renderMs" to p.renderMs.last(),
+            "scriptMs" to p.scriptMs.last(),
+            "audioMs" to p.audioMs.last(),
+            "drawCalls" to engine.renderList.stats.drawCalls,
+            "batches" to engine.renderList.stats.batches,
+            "sprites" to engine.renderList.stats.sprites,
+            "vertices" to engine.renderList.stats.vertices,
+            "itemsCulled" to engine.renderList.stats.itemsCulled,
+            "activeNodes" to p.activeNodes,
+            "totalNodes" to p.totalNodes,
+            "visibleNodes" to p.visibleNodes,
+            "bodies" to p.bodies,
+            "contacts" to p.contacts,
+            "particles" to p.particles,
+            "audioVoices" to p.audioVoices,
+            "scriptInstances" to engine.scripts.instanceCount,
+            "scriptErrors" to engine.scripts.failedCount,
+            "memoryUsed" to (runtime.totalMemory() - runtime.freeMemory()),
+            "memoryMax" to runtime.maxMemory(),
+            "input" to jobj(
+                "moveX" to engine.input.moveX,
+                "moveY" to engine.input.moveY,
+                "actions" to engine.input.snapshot().size
+            )
+        )
+    }
+
+    /** Compact human readable tree with one runtime summary per node (Debugger panel). */
+    fun treeText(engine: Engine, maxNodes: Int = 200): String {
+        val sb = StringBuilder()
+        sb.append("mode=").append(engine.mode.name).append(" scene=").append(engine.scene.name)
+            .append(" nodes=").append(engine.scene.objects.size).append('\n')
+        var shown = 0
+        for (go in engine.scene.objects) {
+            if (shown++ >= maxNodes) {
+                sb.append("  … ").append(engine.scene.objects.size - maxNodes).append(" more\n")
+                break
+            }
+            repeat(depthOf(go).coerceAtMost(8)) { sb.append("  ") }
+            if (!go.active) sb.append("(disabled) ")
+            sb.append(go.name).append(" [").append(go.type).append(']')
+            go.getAny<Rigidbody2D>()?.let { rb ->
+                sb.append(" v=%.2f,%.2f".format(rb.vx, rb.vy))
+                if (rb.grounded) sb.append(" grounded")
+                if (rb.sleeping) sb.append(" sleeping")
+            }
+            go.getAny<com.sengine.engine.core.AnimatedSprite2D>()?.let { a ->
+                sb.append(" frame=").append(a.currentFrame).append(if (a.playing) " playing" else " paused")
+            }
+            go.getAny<ParticleEmitter2D>()?.let { p -> sb.append(" particles=").append(p.particleCount) }
+            if (!go.visible) sb.append(" (hidden)")
+            sb.append('\n')
+        }
+        val s = engine.renderList.stats
+        sb.append("fps=%.1f draw=%d batches=%d nodes=%d bodies=%d particles=%d".format(
+            engine.profiler.smoothFps, s.drawCalls, s.batches,
+            engine.profiler.activeNodes, engine.profiler.bodies, engine.profiler.particles
+        ))
+        return sb.toString()
+    }
+
+    private fun depthOf(go: GameObject): Int {
+        var d = 0
+        var p = go.parent
+        while (p != null) { d++; p = p.parent }
+        return d
     }
 }
 

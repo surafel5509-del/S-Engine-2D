@@ -56,6 +56,11 @@ class ScriptSystem(val engine: Engine) : PhysicsWorld.Listener, SignalHub.Dispat
     val isRunning get() = cx != null
     val instanceCount get() = instances.size
 
+    /** Scripts that threw — surfaced by the debugger panel and the remote inspector. */
+    val failedCount: Int get() = instances.count { it.failed }
+
+    fun failedNodes(): List<Long> = instances.filter { it.failed }.map { it.go.id }
+
     // ------------------------------------------------------------------ lifecycle
     fun begin() {
         end()
@@ -124,6 +129,34 @@ class ScriptSystem(val engine: Engine) : PhysicsWorld.Listener, SignalHub.Dispat
         wrappers.clear()
         compiled.clear()
         com.sengine.engine.debug.Log.info("Script", "Scripts reloaded")
+    }
+
+    /**
+     * Compiles [source] the same way the runtime does and reports every problem it finds, with line
+     * numbers. Used by the script editor's *Check* button, so a script that validates there is a
+     * script that runs in play mode. The source is compiled in a throwaway Rhino context: nothing is
+     * attached to the scene and no instance is created.
+     */
+    fun validate(source: String, onError: (Int, String) -> Unit = { _, _ -> }): List<String> {
+        val problems = ArrayList<String>()
+        val context = Context.enter()
+        try {
+            context.optimizationLevel = -1
+            context.languageVersion = Context.VERSION_ES6
+            context.compileString(source, "script", 1, null)
+        } catch (e: org.mozilla.javascript.RhinoException) {
+            val line = e.lineNumber()
+            val message = e.details()?.trim().orEmpty().ifEmpty { e.toString() }
+            problems.add("line $line: $message")
+            onError(line, message)
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            problems.add("line 0: $message")
+            onError(0, message)
+        } finally {
+            Context.exit()
+        }
+        return problems
     }
 
     /** Releases every script instance (called when a play session ends). */

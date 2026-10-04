@@ -63,6 +63,11 @@ class EditorOverlay {
     var showPixelGrid = false
     var pixelGridStep = 1f / 16f
     var guides: List<FloatArray> = emptyList()   // x0,y0,x1,y1 in world space
+    var selectionRect: FloatArray? = null        // marquee: x, y, w, h in world space
+    var hoveredId = -1L
+    var showCanvasFrame = false
+    var canvasWidth = 0f
+    var canvasHeight = 0f
 }
 
 /**
@@ -275,6 +280,10 @@ class Engine(val project: Project, initialScene: Scene) {
     /** In edit mode scripts may run for live preview, particles keep animating, tiles animate. */
     private fun updateEditorSimulation(dt: Float) {
         profiler.beginPhase()
+        // The UI is laid out in the editor too, so controls are visible (and editable) before play.
+        ui.beginFrame(ui.designWidth, ui.designHeight)
+        UiLayout.layout(scene, ui.designWidth, ui.designHeight)
+        profiler.uiControls = countControls()
         updateParticles(dt, emit = true)
         updateTileAnimations(dt)
         updateSpriteAnimations(dt)
@@ -1170,6 +1179,30 @@ class Engine(val project: Project, initialScene: Scene) {
                 }
                 else -> {}
             }
+        }
+
+        // rectangular selection marquee
+        val marquee = ed.selectionRect
+        if (marquee != null && marquee[2] > 0.001f && marquee[3] > 0.001f) {
+            val c = 0xFFFFFFFF.toInt()
+            outline(marquee[0], marquee[1], marquee[2], marquee[3], c)
+            outline(marquee[0], marquee[1], marquee[2], marquee[3], 0x554DA6FF.toInt())
+        }
+
+        // hover highlight: shows what a click would select
+        if (ed.hoveredId > 0L) {
+            scene.findById(ed.hoveredId)?.let { hovered ->
+                if (hovered.id !in ed.selectionIds && hovered.id != ed.primaryId) {
+                    scene.nodeBounds(hovered)?.let { b -> outline(b.x, b.y, b.width, b.height, 0x99FFFFFF.toInt()) }
+                }
+            }
+        }
+
+        if (ed.showCanvasFrame && ed.canvasWidth > 0f && ed.canvasHeight > 0f) {
+            // the design resolution of the game, so a scene can be composed for the real screen
+            val left = view.cx - ed.canvasWidth * 0.5f
+            val bottom = view.cy - ed.canvasHeight * 0.5f
+            outline(left, bottom, ed.canvasWidth, ed.canvasHeight, 0x66FFFFFF.toInt())
         }
 
         if (ed.drawPhysicsDebug) {

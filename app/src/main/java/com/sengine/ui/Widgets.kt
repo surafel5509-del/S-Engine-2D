@@ -12,6 +12,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.SeekBar
@@ -36,18 +37,36 @@ class EditorButton(
     text: String,
     val onClick: () -> Unit,
     var toggled: Boolean = false,
-    var icon: String = ""
+    var icon: String = "",
+    val iconKind: Int = -1,
+    val minWidthDp: Float = 0f,
+    val compact: Boolean = false
 ) : FrameLayout(context) {
 
     private val label = TextView(context)
+    private val iconView: IconView? = if (iconKind >= 0) IconView(context, theme, iconKind, if (compact) 16f else 17f) else null
+    private val row = LinearLayout(context)
 
     init {
-        label.text = if (icon.isEmpty()) text else "$icon  $text"
+        // One line, always: buttons in toolbars and tabs must never wrap character by character.
+        label.text = if (iconKind >= 0 || icon.isEmpty()) text else "$icon  $text"
         label.gravity = Gravity.CENTER
         label.setTextColor(theme.text)
-        label.textSize = theme.textSize(12f)
-        label.setPadding(theme.pad(10f), theme.pad(6f), theme.pad(10f), theme.pad(6f))
-        addView(label, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        label.textSize = theme.textSize(if (compact) 11f else 12f)
+        label.isSingleLine = true
+        label.ellipsize = android.text.TextUtils.TruncateAt.END
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER
+        row.setPadding(theme.pad(if (compact) 6f else 9f), theme.pad(if (compact) 4f else 6f), theme.pad(if (compact) 6f else 9f), theme.pad(if (compact) 4f else 6f))
+        val icon = iconView
+        if (icon != null) {
+            icon.color = theme.text
+            row.addView(icon)
+            row.addView(View(context), LinearLayout.LayoutParams(theme.pad(4f), 1))
+        }
+        row.addView(label)
+        addView(row, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+        if (minWidthDp > 0f) minimumWidth = theme.dp(minWidthDp)
         refresh()
         setOnClickListener { onClick() }
         isClickable = true
@@ -57,14 +76,21 @@ class EditorButton(
     fun refresh() {
         background = theme.rounded(
             if (toggled) theme.selection else theme.panelAlt,
-            4f,
+            5f,
             if (toggled) theme.accent else theme.border
         )
-        label.setTextColor(if (toggled) theme.text else theme.text)
+        label.setTextColor(if (toggled) theme.text else theme.textDim)
+        iconView?.color = if (toggled) theme.accent else theme.textDim
+        iconView?.invalidate()
     }
 
     fun setText(text: String) {
-        label.text = if (icon.isEmpty()) text else "$icon  $text"
+        label.text = text
+    }
+
+    fun setIconKind(kind: Int) {
+        iconView?.kind = kind
+        iconView?.invalidate()
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -76,27 +102,51 @@ class EditorButton(
     }
 }
 
-/** Horizontal tab strip used by every dock. */
-class TabStrip(context: Context, val theme: Theme, var onSelect: (Int) -> Unit = {}) : LinearLayout(context) {
+/**
+ * A row of dock tabs.
+ *
+ * Tabs are single line and scroll horizontally when there are many of them, so a narrow dock never
+ * squeezes the labels into vertical letter stacks.
+ */
+class TabStrip(context: Context, val theme: Theme, var onSelect: (Int) -> Unit = {}) : HorizontalScrollView(context) {
+
+    /** Tab names in display order — used to reveal a panel by name from anywhere in the editor. */
+    private val tabNames = ArrayList<String>()
+
+    fun indexOf(name: String): Int = tabNames.indexOfFirst { it.equals(name, ignoreCase = true) }
+
     private val buttons = ArrayList<EditorButton>()
+    private val row = LinearLayout(context)
     var selected = 0
         private set
 
-    init { orientation = HORIZONTAL }
+    init {
+        isHorizontalScrollBarEnabled = false
+        row.orientation = LinearLayout.HORIZONTAL
+        addView(row, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+    }
 
-    fun setTabs(names: List<String>) {
-        removeAllViews()
+    fun setTabs(names: List<String>) { setTabItems(names.map { it to -1 }) }
+
+    /** Tabs with an icon each; pass -1 to fall back to text only. */
+    fun setTabItems(names: List<Pair<String, Int>>) {
+        row.removeAllViews()
         buttons.clear()
-        for ((i, name) in names.withIndex()) {
-            val b = EditorButton(context, theme, name, {
+        tabNames.clear()
+        tabNames.addAll(names.map { it.first })
+        for ((i, spec) in names.withIndex()) {
+            val b = EditorButton(context, theme, spec.first, {
                 select(i)
                 onSelect(i)
-            })
-            b.layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-            addView(b)
+            }, iconKind = spec.second, compact = true)
+            b.layoutParams = LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                marginStart = theme.pad(1f)
+                marginEnd = theme.pad(1f)
+            }
+            row.addView(b)
             buttons.add(b)
         }
-        select(selected.coerceIn(0, names.size - 1))
+        select(selected.coerceIn(0, (names.size - 1).coerceAtLeast(0)))
     }
 
     fun select(index: Int) {
@@ -261,7 +311,7 @@ class Vector2Field(
         orientation = VERTICAL
         addView(Ui.label(context, label, theme, 11f, theme.textDim))
         val row = LinearLayout(context)
-        row.orientation = HORIZONTAL
+        row.orientation = LinearLayout.HORIZONTAL
         addView(row)
         fx = NumberField(context, theme, "X", x, step, onChange = { nx -> callback(nx, fy.value) })
         fy = NumberField(context, theme, "Y", y, step, onChange = { ny -> callback(fx.value, ny) })
@@ -478,7 +528,8 @@ class SearchField(context: Context, val theme: Theme, hint: String = "Search", v
         orientation = HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         setBackgroundColor(theme.panelAlt)
-        val icon = Ui.label(context, "⌕", theme, 15f, theme.textDim)
+        val icon = IconView(context, theme, Icons.SEARCH, 16f)
+        icon.color = theme.textDim
         addView(icon)
         edit.background = null
         edit.addTextChangedListener(object : android.text.TextWatcher {
